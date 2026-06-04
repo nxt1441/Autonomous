@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://api.github.com/repos/duchieuvn/autonomous2/git/trees/main?recursive=1\")",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(f['path']\\) for f in data.get\\('tree',[]\\) if f['type']=='blob']\")",
+      "Bash(curl -s https://raw.githubusercontent.com/duchieuvn/autonomous2/main/src/controllers/main/__TRACKED_VAR__)",
+      "Bash(python3 -c ' *)",
+      "Bash(grep -n \"pygame\\\\|Supervisor\\\\|import random$\" my_robot.py map.py main_ref.py)",
+      "Bash(python3 *)"
+    ]
+  }
+}
