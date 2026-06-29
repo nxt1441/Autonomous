@@ -400,7 +400,6 @@ class MyRobot(Robot):
         """
         if self.camera_depth is None:
             return
-        # First try to get floating-wall points (require_ground_support=True)
         pts_local = self._depth_obstacle_points_local(pixel_stride=depth_stride,
                                                      max_depth=max_depth,
                                                      require_ground_support=True)
@@ -432,27 +431,94 @@ class MyRobot(Robot):
                              if 0 <= int(mx) < MAP_SIZE and 0 <= int(my) < MAP_SIZE)
             filtered_set = set()
             grid = self.occ_map.grid_map
+            self._clear_depth_cells_near_lidar_walls(radius=1)
             for mx, my in unique_set:
-                if grid[my, mx] not in (GREEN_CARPET, CLOSED):
+                if (grid[my, mx] not in (GREEN_CARPET, CLOSED, OBSTACLE) and
+                        not self._cell_near_lidar_wall(mx, my, radius=1)):
                     filtered_set.add((mx, my))
             if not filtered_set:
                 self.occ_map.floating_points = []
                 return
+            if not self._floating_cells_wall_like(filtered_set):
+                self.occ_map.floating_points = []
+                return
+
+            orient = self._classify_floating_wall(pts_local)
+            if orient is not None:
+                self.last_floating_wall_orientation = orient
+            else:
+                orient = self.last_floating_wall_orientation
+
+            wall_cells = self._rasterize_floating_wall_cells(filtered_set, orient)
+            if not wall_cells:
+                self.occ_map.floating_points = []
+                return
+
+            if self._floating_wall_is_passable(pts_local):
+                self.occ_map._depth_obstacle_cells.difference_update(wall_cells)
+                for mx, my in wall_cells:
+                    if (0 <= mx < MAP_SIZE and 0 <= my < MAP_SIZE and
+                            self.occ_map.grid_map[my, mx] == DEPTH_OBSTACLE):
+                        self.occ_map.grid_map[my, mx] = FREESPACE
+                self.occ_map.floating_points = []
+                self.occ_map.build_cost_map()
+                return
+
             # Register in the persistent depth-obstacle set so rebuild_grid (triggered by
             # every lidar scan) cannot erase them — lidar passes under/over these walls.
-            self.occ_map._depth_obstacle_cells.update(filtered_set)
+            self.occ_map._depth_obstacle_cells.update(wall_cells)
             # Mark immediately in the live grid as well
-            for mx, my in filtered_set:
-                self.occ_map.grid_map[my, mx] = DEPTH_OBSTACLE
+            for mx, my in wall_cells:
+                if (0 <= mx < MAP_SIZE and 0 <= my < MAP_SIZE and
+                        self.occ_map.grid_map[my, mx] not in (GREEN_CARPET, CLOSED)):
+                    self.occ_map.grid_map[my, mx] = DEPTH_OBSTACLE
             self.occ_map.build_cost_map()
-            orient = self._classify_floating_wall(pts_local)
             color_tag = orient if orient is not None else 'vertical'
-            self.occ_map.floating_points = [(mx, my, color_tag) for mx, my in filtered_set]
+            self.occ_map.floating_points = [(mx, my, color_tag) for mx, my in wall_cells]
             return
 
         # No floating-wall points: do not plot any depth obstacles.
         self.occ_map.floating_points = []
         return
+
+    def _cell_near_lidar_wall(self, mx, my, radius=3):
+        grid = self.occ_map.grid_map
+        y0 = max(0, int(my) - radius)
+        y1 = min(grid.shape[0], int(my) + radius + 1)
+        x0 = max(0, int(mx) - radius)
+        x1 = min(grid.shape[1], int(mx) + radius + 1)
+        return bool(np.any(grid[y0:y1, x0:x1] == OBSTACLE))
+
+    def _clear_depth_cells_near_lidar_walls(self, radius=3):
+        cells = getattr(self.occ_map, '_depth_obstacle_cells', set())
+        if not cells:
+            return
+        remove = {cell for cell in cells
+                  if self._cell_near_lidar_wall(cell[0], cell[1], radius=radius)}
+        if not remove:
+            return
+        cells.difference_update(remove)
+        grid = self.occ_map.grid_map
+        for mx, my in remove:
+            if 0 <= mx < grid.shape[1] and 0 <= my < grid.shape[0] and grid[my, mx] == DEPTH_OBSTACLE:
+                grid[my, mx] = FREESPACE
+
+    def _floating_cells_wall_like(self, cells):
+        if len(cells) < 3:
+            return False
+        pts = np.array(list(cells), dtype=np.float32)
+        centered = pts - pts.mean(axis=0)
+        try:
+            _, s, _ = np.linalg.svd(centered, full_matrices=False)
+        except Exception:
+            return False
+        major = float(s[0]) if len(s) else 0.0
+        minor = float(s[1]) if len(s) > 1 else 0.0
+        span_x = float(np.max(pts[:, 0]) - np.min(pts[:, 0]) + 1.0)
+        span_y = float(np.max(pts[:, 1]) - np.min(pts[:, 1]) + 1.0)
+        if max(span_x, span_y) < 4.0:
+            return False
+        return major >= 2.0 and major / max(minor, 1e-3) >= 1.8
 
     # ── Camera helpers ────────────────────────────────────────────────────────
 
@@ -712,8 +778,16 @@ class MyRobot(Robot):
         """
         if pts is None or len(pts) == 0:
             return True
-        usable_clearance = self.camera_height_m + 0.02
-        return float(np.min(pts[:, 2])) > usable_clearance
+        heights = pts[:, 2].astype(np.float32)
+        heights = heights[np.isfinite(heights)]
+        if len(heights) == 0:
+            return True
+
+        robot_blocking_height = self.camera_height_m + 0.07
+        low_count = int(np.count_nonzero(heights <= robot_blocking_height))
+        low_ratio = float(low_count / len(heights))
+
+        return low_count < 3 or low_ratio < 0.12
 
     def _rasterize_floating_wall_cells(self, cells, orientation=None):
         if not cells:
@@ -722,18 +796,35 @@ class MyRobot(Robot):
         if pts.shape[0] == 1:
             return {(int(pts[0, 0]), int(pts[0, 1]))}
 
-        if orientation == 'vertical':
-            order = np.lexsort((pts[:, 0], pts[:, 1]))
-        else:
-            # Default to the robot-forward axis so slightly noisy point clouds
-            # collapse into one continuous wall trace instead of scattered dots.
-            order = np.lexsort((pts[:, 1], pts[:, 0]))
-        pts = pts[order]
+        centered = pts.astype(np.float32) - pts.astype(np.float32).mean(axis=0)
+        try:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+            axis = vh[0]
+            if not np.all(np.isfinite(axis)) or np.linalg.norm(axis) < 1e-6:
+                axis = np.array([1.0, 0.0], dtype=np.float32)
+        except Exception:
+            axis = np.array([1.0, 0.0], dtype=np.float32)
 
+        projection = centered @ axis
+        order = np.argsort(projection)
+        pts = pts[order]
+        projection = projection[order]
+
+        end_cap = max(2, int(math.ceil(0.12 / RESOLUTION)))
         raster = set()
-        for p0, p1 in zip(pts[:-1], pts[1:]):
+        max_gap = max(14, int(DEPTH_OBSTACLE_BRIDGE_GAP_CELLS) + 1)
+        for i, (p0, p1) in enumerate(zip(pts[:-1], pts[1:])):
+            if projection[i + 1] - projection[i] > max_gap:
+                continue
             for x, y in utils.ray_cells((int(p0[0]), int(p0[1])),
                                         (int(p1[0]), int(p1[1]))):
+                raster.add((x, y))
+        for x, y in pts:
+            raster.add((int(x), int(y)))
+        for src, sign in ((pts[0], -1.0), (pts[-1], 1.0)):
+            dst = src.astype(np.float32) + axis.astype(np.float32) * float(sign * end_cap)
+            for x, y in utils.ray_cells((int(src[0]), int(src[1])),
+                                        (int(round(float(dst[0]))), int(round(float(dst[1]))))):
                 raster.add((x, y))
 
         # Thicken the trace a little so the wall reads as a wall in the map.

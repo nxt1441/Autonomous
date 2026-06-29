@@ -114,7 +114,7 @@ class MapRenderer:
             for px, py in path:
                 px, py = int(px), int(py)
                 if 0 <= px < w and 0 <= py < h:
-                    rgb[py, px] = (255, 0, 0)
+                    rgb[py, px] = (0, 120, 255)
         if target:
             _mark(target[0], target[1], (0, 255, 0), r=4)
         if columns:
