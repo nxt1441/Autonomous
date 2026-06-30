@@ -70,6 +70,7 @@ class MyRobot(Robot):
         self._rt_new_path        = None   # freshly replanned path (written by planner)
         self._rt_replan_ready    = False  # True when _rt_new_path is ready to consume
         self._rt_planner_lock    = threading.Lock()
+        self._last_rt_swap_time  = 0.0
 
         self.stuck_thread        = None
         self.stuck_thread_running = False
@@ -504,9 +505,11 @@ class MyRobot(Robot):
                 grid[my, mx] = FREESPACE
 
     def _floating_cells_wall_like(self, cells):
-        if len(cells) < 3:
+        if len(cells) < 2:
             return False
         pts = np.array(list(cells), dtype=np.float32)
+        if len(cells) == 2:
+            return float(np.linalg.norm(pts[1] - pts[0])) >= 2.0
         centered = pts - pts.mean(axis=0)
         try:
             _, s, _ = np.linalg.svd(centered, full_matrices=False)
@@ -516,9 +519,9 @@ class MyRobot(Robot):
         minor = float(s[1]) if len(s) > 1 else 0.0
         span_x = float(np.max(pts[:, 0]) - np.min(pts[:, 0]) + 1.0)
         span_y = float(np.max(pts[:, 1]) - np.min(pts[:, 1]) + 1.0)
-        if max(span_x, span_y) < 4.0:
+        if max(span_x, span_y) < 3.0:
             return False
-        return major >= 2.0 and major / max(minor, 1e-3) >= 1.8
+        return major >= 1.5 and major / max(minor, 1e-3) >= 1.4
 
     # ── Camera helpers ────────────────────────────────────────────────────────
 
@@ -786,8 +789,14 @@ class MyRobot(Robot):
         robot_blocking_height = self.camera_height_m + 0.07
         low_count = int(np.count_nonzero(heights <= robot_blocking_height))
         low_ratio = float(low_count / len(heights))
+        median_h = float(np.median(heights))
+        height_span = float(np.max(heights) - np.min(heights))
 
-        return low_count < 3 or low_ratio < 0.12
+        if median_h <= robot_blocking_height:
+            return False
+        if height_span >= 0.15 and low_count >= 3 and low_ratio >= 0.12:
+            return False
+        return True
 
     def _rasterize_floating_wall_cells(self, cells, orientation=None):
         if not cells:
@@ -950,6 +959,18 @@ class MyRobot(Robot):
     def there_is_obstacle(self, map_target):
         return self.occ_map.cell_blocked(map_target)
 
+    def footprint_has_obstacle(self, mx, my, radius=2):
+        grid = self.occ_map.grid_map
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx * dx + dy * dy > radius * radius:
+                    continue
+                x, y = int(mx) + dx, int(my) + dy
+                if 0 <= x < grid.shape[1] and 0 <= y < grid.shape[0]:
+                    if self.occ_map.cell_blocked((x, y)):
+                        return True
+        return False
+
     def robot_stuck(self, last_pos, stuck_distance=0.16):
         return np.linalg.norm(self.get_position() - last_pos) < stuck_distance
 
@@ -971,7 +992,7 @@ class MyRobot(Robot):
                     cy += v * np.sin(ct) * dt
                     ct += w * dt
                     pmx, pmy = self.convert_to_map_coordinates(cx, cy)
-                    if self.there_is_obstacle([pmx, pmy]):
+                    if self.footprint_has_obstacle(pmx, pmy, radius=2):
                         ok = False
                         break
                 if not ok:
@@ -1737,6 +1758,21 @@ class MyRobot(Robot):
                 return path
         return None
 
+    def _paths_similar(self, a, b, stride=5, max_delta=3.0):
+        if not a or not b:
+            return False
+        if abs(len(a) - len(b)) <= 2:
+            sample_count = min(len(a), len(b), 6)
+            if sample_count <= 1:
+                return True
+            idxs = np.linspace(0, min(len(a), len(b)) - 1, sample_count).astype(int)
+            deltas = [
+                np.linalg.norm(np.array(a[i], dtype=float) - np.array(b[i], dtype=float))
+                for i in idxs
+            ]
+            return max(deltas, default=0.0) <= max_delta
+        return False
+
     def _realtime_planner_loop(self):
         """Background thread: every 80 ms check the active path against the
         live map and replan immediately (same goal) when a segment is blocked."""
@@ -1814,8 +1850,7 @@ class MyRobot(Robot):
                     with self.lidar_lock:
                         self._refresh_map_lidar()
                         depth_tick += 1
-                        if depth_tick % 3 == 0:
-                            self._refresh_map_depth()
+                        self._refresh_map_depth()
                         if depth_tick % 15 == 0:
                             self.occ_map.build_cost_map()
                 time.sleep(0.05)
@@ -1888,13 +1923,17 @@ class MyRobot(Robot):
 
                     rt = self.poll_realtime_planner()
                     if rt:
-                        cur_path = rt
-                        self.update_realtime_path(cur_path)
-                        tidx = 0  # outer loop adds 3 → starts at path[3]
-                        with self.occ_map.vis_lock:
-                            self.occ_map.current_path = cur_path
-                        print('[RT-Planner] Path swapped in navigate_frontier')
-                        break
+                        now = time.time()
+                        if (now - self._last_rt_swap_time >= 1.0 and
+                                not self._paths_similar(cur_path, rt)):
+                            cur_path = rt
+                            self.update_realtime_path(cur_path)
+                            self._last_rt_swap_time = now
+                            tidx = 0  # outer loop adds 3 → starts at path[3]
+                            with self.occ_map.vis_lock:
+                                self.occ_map.current_path = cur_path
+                            print('[RT-Planner] Path swapped in navigate_frontier')
+                            break
 
                     if self.interrupt_path:
                         self.stop_motor()
