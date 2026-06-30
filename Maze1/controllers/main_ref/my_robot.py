@@ -455,8 +455,8 @@ class MyRobot(Robot):
                 if self._floating_wall_is_passable(cluster_pts):
                     self._clear_depth_cells_near_cells(cluster, radius=5)
                     continue
-                self._clear_depth_cells_near_cells(cluster, radius=3)
-                wall_cells.update(self._rasterize_floating_wall_cells(cluster, orient))
+                wall_cells.update(self._rasterize_floating_wall_cells(cluster, orient,
+                                                                      robot_cell=(rx_m, ry_m)))
 
             if not wall_cells:
                 self.occ_map.floating_points = []
@@ -783,8 +783,10 @@ class MyRobot(Robot):
                 u_col = int(uu[i])
                 v_row = int(vv[i])
                 d_ref = float(d[i])
-                # Skip: this point is behind a closer obstacle in the same column.
-                if d_ref - min_depth_per_col[u_col] > 0.20:
+                # Skip only obvious background behind a closer surface. A lower
+                # threshold drops the rear/side edge of floating planes, so the
+                # map never gets updated from the opposite approach angle.
+                if d_ref - min_depth_per_col[u_col] > 0.30:
                     support_ok[i] = True  # treat as supported so it is excluded
                     continue
                 for sv in range(v_row + 1, h):
@@ -844,51 +846,75 @@ class MyRobot(Robot):
             return False
         return True
 
-    def _rasterize_floating_wall_cells(self, cells, orientation=None):
-        if not cells:
-            return set()
-        pts = np.array(list(cells), dtype=np.int32)
-        if pts.shape[0] == 1:
-            return {(int(pts[0, 0]), int(pts[0, 1]))}
-
-        centered = pts.astype(np.float32) - pts.astype(np.float32).mean(axis=0)
+    def _floating_cluster_stats(self, cells):
+        pts = np.array(list(cells), dtype=np.float32)
+        if pts.shape[0] < 2:
+            return pts, np.array([1.0, 0.0], dtype=np.float32), 0.0, 0.0
+        centered = pts - pts.mean(axis=0)
         try:
-            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+            _, s, vh = np.linalg.svd(centered, full_matrices=False)
             axis = vh[0]
             if not np.all(np.isfinite(axis)) or np.linalg.norm(axis) < 1e-6:
                 axis = np.array([1.0, 0.0], dtype=np.float32)
         except Exception:
+            s = np.array([0.0, 0.0], dtype=np.float32)
             axis = np.array([1.0, 0.0], dtype=np.float32)
+        major = float(s[0]) if len(s) else 0.0
+        minor = float(s[1]) if len(s) > 1 else 0.0
+        return pts, axis.astype(np.float32), major, minor
+
+    def _front_edge_cells(self, cells, robot_cell):
+        pts, axis, major, minor = self._floating_cluster_stats(cells)
+        if pts.shape[0] < 4 or robot_cell is None:
+            return set(cells)
+        # Broad depth clusters are horizontal planes/top faces. For those, draw
+        # only the edge facing the robot instead of filling/drawing through the
+        # visible surface.
+        if minor < 1.8 or major / max(minor, 1e-3) > 4.0:
+            return set(cells)
+        center = pts.mean(axis=0)
+        view = center - np.array(robot_cell, dtype=np.float32)
+        norm = float(np.linalg.norm(view))
+        if norm < 1e-6:
+            return set(cells)
+        view /= norm
+        depth = pts @ view
+        near = float(np.min(depth))
+        edge_pts = pts[depth <= near + 1.5]
+        if edge_pts.shape[0] < 2:
+            return set(cells)
+        return {(int(round(float(x))), int(round(float(y)))) for x, y in edge_pts}
+
+    def _rasterize_floating_wall_cells(self, cells, orientation=None, robot_cell=None):
+        if not cells:
+            return set()
+        cells = self._front_edge_cells(cells, robot_cell)
+        pts = np.array(list(cells), dtype=np.int32)
+        if pts.shape[0] == 1:
+            return {(int(pts[0, 0]), int(pts[0, 1]))}
+
+        pts_f, axis, _, _ = self._floating_cluster_stats(cells)
+        centered = pts_f - pts_f.mean(axis=0)
 
         projection = centered @ axis
         order = np.argsort(projection)
         pts = pts[order]
         projection = projection[order]
 
-        end_cap = max(1, int(math.ceil(0.06 / RESOLUTION)))
         raster = set()
-        max_gap = max(5, int(DEPTH_OBSTACLE_BRIDGE_GAP_CELLS) + 1)
-        center = pts.astype(np.float32).mean(axis=0)
+        max_gap = max(4, int(DEPTH_OBSTACLE_BRIDGE_GAP_CELLS))
 
-        # Draw only confirmed projection runs on the fitted centerline. This removes
-        # parallel depth speckle while avoiding long artificial extensions through gaps.
-        run_start = 0
-        runs = []
-        for i in range(len(projection) - 1):
+        # Mark directly observed cells and only bridge tiny gaps between adjacent
+        # observed cells. No fitted centerline or endpoint extension is used here.
+        for x, y in pts:
+            raster.add((int(x), int(y)))
+        for i, (p0, p1) in enumerate(zip(pts[:-1], pts[1:])):
             if projection[i + 1] - projection[i] > max_gap:
-                runs.append((run_start, i))
-                run_start = i + 1
-        runs.append((run_start, len(projection) - 1))
-
-        for start, end in runs:
-            if end <= start:
-                p = center + axis * projection[start]
-                raster.add((int(round(float(p[0]))), int(round(float(p[1])))))
                 continue
-            p0 = center + axis * (projection[start] - end_cap)
-            p1 = center + axis * (projection[end] + end_cap)
-            for x, y in utils.ray_cells((int(round(float(p0[0]))), int(round(float(p0[1])))),
-                                        (int(round(float(p1[0]))), int(round(float(p1[1]))))):
+            if float(np.linalg.norm(p1.astype(np.float32) - p0.astype(np.float32))) > max_gap:
+                continue
+            for x, y in utils.ray_cells((int(p0[0]), int(p0[1])),
+                                        (int(p1[0]), int(p1[1]))):
                 raster.add((x, y))
 
         # Thicken the trace a little so the wall reads as a wall in the map.
