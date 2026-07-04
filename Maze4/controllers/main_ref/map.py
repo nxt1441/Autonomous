@@ -46,7 +46,7 @@ class MapRenderer:
         self._ax.set_title('Occupancy Grid — Live')
         self._ax.axis('off')
         blank = np.full((self._size, self._size, 3), 80, dtype=np.uint8)
-        self._im = self._ax.imshow(blank, interpolation='nearest')
+        self._im = self._ax.imshow(blank, interpolation='bilinear')
         self._fig.tight_layout()
         self._fig.canvas.draw()
         try:
@@ -64,8 +64,8 @@ class MapRenderer:
         # Cost map heat overlay: tint freespace cells orange near walls
         if cost_map is not None:
             free_mask = (grid == FREESPACE)
-            heat = np.clip(cost_map * 220, 0, 220).astype(np.int16)
-            active = free_mask & (heat > 10)
+            heat = np.clip(cost_map * 200, 0, 220).astype(np.int16)
+            active = free_mask & (heat > 40)
             rgb[active, 0] = np.clip(
                 rgb[active, 0].astype(np.int16) + heat[active], 0, 255
             ).astype(np.uint8)
@@ -114,7 +114,7 @@ class MapRenderer:
             for px, py in path:
                 px, py = int(px), int(py)
                 if 0 <= px < w and 0 <= py < h:
-                    rgb[py, px] = (255, 0, 0)
+                    rgb[py, px] = (0, 120, 255)
         if target:
             _mark(target[0], target[1], (0, 255, 0), r=4)
         if columns:
@@ -131,12 +131,18 @@ class MapRenderer:
         # Floating wall overlay: list of (x, y, orientation) where orientation is
         # 'horizontal' or 'vertical' — choose colors accordingly
         if floating_points:
+            grouped = {}
             for fx, fy, orient in floating_points:
-                if isinstance(orient, str) and orient.startswith('passable_'):
-                    col = (80, 220, 80)
-                else:
-                    col = (200, 0, 200) if orient == 'horizontal' else (0, 200, 200)
-                _mark(fx, fy, col, r=2)
+                grouped.setdefault(orient, []).append((int(fx), int(fy)))
+            for orient, pts in grouped.items():
+                col = (200, 0, 200) if orient == 'horizontal' else (0, 200, 200)
+                pts = sorted(set(pts), key=lambda p: (p[0], p[1]) if orient != 'vertical' else (p[1], p[0]))
+                if len(pts) == 1:
+                    _mark(pts[0][0], pts[0][1], col, r=2)
+                    continue
+                for p0, p1 in zip(pts[:-1], pts[1:]):
+                    for x, y in utils.ray_cells(p0, p1):
+                        _mark(x, y, col, r=1)
 
         self._im.set_data(rgb)
         try:
@@ -194,34 +200,18 @@ class OccupancyGrid:
     def _apply_ray_update(self, robot_pos, lidar_pts):
         # Floating-wall cells are owned by the depth sensor; LiDAR must not touch them.
         depth_cells = self._depth_obstacle_cells
-        max_range_cells = LIDAR_MAX_RANGE / self.resolution
-        frontier_preserve_cells = max(2, int(round(0.18 / self.resolution)))
         for pt in lidar_pts:
             cells = utils.ray_cells(robot_pos, pt)
-            if not cells:
-                continue
-
-            ray_len = float(np.hypot(pt[0] - robot_pos[0], pt[1] - robot_pos[1]))
-            is_open_ended = ray_len >= (max_range_cells - 1.5)
-
-            clear_upto = len(cells) - 1
-            if is_open_ended:
-                clear_upto = max(0, clear_upto - frontier_preserve_cells)
-
-            for x, y in cells[:clear_upto]:
+            for x, y in cells[:-1]:
                 if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE:
                     if (x, y) in depth_cells:
                         continue
-                    if self.log_odds[y, x] < 2.0:
-                        self.log_odds[y, x] -= 0.22
-
-            if is_open_ended:
-                continue
-
+                    if self.log_odds[y, x] < 3.5:
+                        self.log_odds[y, x] -= 0.08
             x, y = cells[-1]
             if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE:
                 if (x, y) not in depth_cells:
-                    self.log_odds[y, x] += 0.85
+                    self.log_odds[y, x] += 1.2
 
     def rebuild_grid(self):
         clipped = np.clip(self.log_odds, -5, 5)
@@ -242,24 +232,17 @@ class OccupancyGrid:
         protected   = closed_mask | green_mask | depth_mask
 
         unknown_mask  = (self.log_odds == INITIAL_LOG_ODD) & ~protected
-        obstacle_mask = (P > 0.7) & ~protected
-        free_mask     = (P < 0.5) & ~protected
+        obstacle_mask = (P > 0.85) & ~protected
+        free_mask     = (P < 0.42) & ~protected
 
         # Connected-component filter: drop noise blobs < 8 px
         obs_bin = obstacle_mask.astype(np.uint8)
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(obs_bin, connectivity=4)
         clean = np.zeros_like(obs_bin)
         for i in range(1, n_labels):
-            if stats[i, cv2.CC_STAT_AREA] >= 18:
+            if stats[i, cv2.CC_STAT_AREA] >= 40:
                 clean[labels == i] = 1
         obstacle_mask = clean.astype(bool) & ~protected
-
-        # Morphological smoothing to reduce pixelated obstacle edges (Problem 4)
-        _kernel = np.ones((5, 5), np.uint8)
-        _obs_u8 = obstacle_mask.astype(np.uint8)
-        _obs_u8 = cv2.morphologyEx(_obs_u8, cv2.MORPH_CLOSE, _kernel)
-        _obs_u8 = cv2.morphologyEx(_obs_u8, cv2.MORPH_OPEN, _kernel)
-        obstacle_mask = _obs_u8.astype(bool) & ~protected
 
         self.grid_map[obstacle_mask] = OBSTACLE
         self.grid_map[free_mask]     = FREESPACE
@@ -278,7 +261,9 @@ class OccupancyGrid:
             xs_d, ys_d = xs_d[in_bounds], ys_d[in_bounds]
             if len(xs_d):
                 cur = self.grid_map[ys_d, xs_d]
-                unprotected = (cur != GREEN_CARPET) & (cur != CLOSED)
+                # Do not override a LiDAR-confirmed regular wall (OBSTACLE) with
+                # DEPTH_OBSTACLE — let LiDAR win so wrongly-detected cells self-correct.
+                unprotected = (cur != GREEN_CARPET) & (cur != CLOSED) & (cur != OBSTACLE)
                 self.grid_map[ys_d[unprotected], xs_d[unprotected]] = DEPTH_OBSTACLE
 
     def process_scan(self, robot_pos, lidar_points):
@@ -291,7 +276,7 @@ class OccupancyGrid:
         if 0 <= x < self.map_size and 0 <= y < self.map_size:
             self.grid_map[y, x] = value
 
-    def build_cost_map(self, max_dist=12):
+    def build_cost_map(self, max_dist=8):
         from scipy.ndimage import distance_transform_edt
         obs = ((self.grid_map == OBSTACLE) |
                (self.grid_map == DEPTH_OBSTACLE) |
@@ -399,8 +384,7 @@ class OccupancyGrid:
         """
         if inflation_levels is None:
             inflation_levels = ASTAR_INFLATION_LEVELS
-        best_path, best_len = None, float('inf')
-        fallback_path, fallback_len = None, 0.0
+        best_path, best_len = None, 0.0
         cost_map_to_use = self.cost_map if cost_map_override is None else cost_map_override
         for inflation in inflation_levels:
             base = self.grid_map.copy().astype(np.float32)
@@ -415,19 +399,10 @@ class OccupancyGrid:
             tmp = utils.dilate_obstacles(tmp, inflation_pixels=inflation)
             tmp[c_mask] = OBSTACLE
             tmp[g_mask] = OBSTACLE
-            if not g_mask[int(end[1]), int(end[0])]:
-                utils.clear_around_point(tmp, end, inflation_pixels=ASTAR_EXPANSION_PIXELS)
-            if not g_mask[int(start[1]), int(start[0])]:
-                utils.clear_around_point(tmp, start, inflation_pixels=ASTAR_EXPANSION_PIXELS)
+            utils.clear_around_point(tmp, end,   inflation_pixels=ASTAR_EXPANSION_PIXELS)
+            utils.clear_around_point(tmp, start, inflation_pixels=ASTAR_EXPANSION_PIXELS)
             path = _astar(tmp, start, end, cost_map=cost_map_to_use)
             if path is None or len(path) <= 1:
-                continue
-            if any(g_mask[int(py), int(px)] for px, py in path
-                   if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
-                continue
-            clearance_tmp = utils.dilate_obstacles(tmp.copy(), inflation_pixels=ASTAR_MIN_CLEARANCE_PIXELS)
-            if any(clearance_tmp[int(py), int(px)] == OBSTACLE for px, py in path[2:-2]
-                   if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
                 continue
             try:
                 total = 0.0
@@ -439,11 +414,10 @@ class OccupancyGrid:
             except Exception:
                 total = 0.0
             if total >= PATH_MIN_LENGTH_M:
-                if total < best_len:
-                    best_len, best_path = total, path
-            elif total > fallback_len:
-                fallback_len, fallback_path = total, path
-        return best_path if best_path is not None else fallback_path
+                return path
+            if total > best_len:
+                best_len, best_path = total, path
+        return best_path
 
     def frontier_path(self, start, end):
         if start is None or end is None:
@@ -459,22 +433,16 @@ class OccupancyGrid:
         tmp = utils.dilate_obstacles(tmp, inflation_pixels=ASTAR_FRONTIER_INFLATION)
         tmp[c_mask] = OBSTACLE
         tmp[g_mask] = OBSTACLE
-        if not g_mask[int(end[1]), int(end[0])]:
-            utils.clear_around_point(tmp, end, inflation_pixels=ASTAR_EXPANSION_PIXELS)
-        if not g_mask[int(start[1]), int(start[0])]:
-            utils.clear_around_point(tmp, start, inflation_pixels=ASTAR_EXPANSION_PIXELS)
-        path = _astar(tmp, start, end, cost_map=self.cost_map)
-        if path and any(g_mask[int(py), int(px)] for px, py in path
-                        if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
-            return None
-        return path
+        utils.clear_around_point(tmp, end,   inflation_pixels=ASTAR_EXPANSION_PIXELS)
+        utils.clear_around_point(tmp, start, inflation_pixels=ASTAR_EXPANSION_PIXELS)
+        return _astar(tmp, start, end, cost_map=self.cost_map)
 
     # ── Coordinate conversion ─────────────────────────────────────────────────
 
     def world_pts_to_map(self, pts_world):
         R = np.array([[1 / RESOLUTION, 0], [0, -1 / RESOLUTION]])
         t = np.array([MAP_SIZE // 2, MAP_SIZE // 2])
-        return (pts_world @ R.T + t).astype(np.int32)
+        return np.rint(pts_world @ R.T + t).astype(np.int32)
 
     # ── Visualisation ─────────────────────────────────────────────────────────
 
