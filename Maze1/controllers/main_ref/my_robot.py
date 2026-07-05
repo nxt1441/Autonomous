@@ -429,10 +429,8 @@ class MyRobot(Robot):
             unique_set = set(cell_heights.keys())
             filtered_set = set()
             grid = self.occ_map.grid_map
-            self._clear_depth_cells_near_lidar_walls(radius=2)
             for mx, my in unique_set:
-                if (grid[my, mx] not in (GREEN_CARPET, CLOSED, OBSTACLE) and
-                        not self._cell_near_lidar_wall(mx, my, radius=2)):
+                if grid[my, mx] not in (GREEN_CARPET, CLOSED, OBSTACLE):
                     filtered_set.add((mx, my))
             if not filtered_set:
                 self.occ_map.floating_points = []
@@ -468,7 +466,7 @@ class MyRobot(Robot):
             # Mark immediately in the live grid as well
             for mx, my in wall_cells:
                 if (0 <= mx < MAP_SIZE and 0 <= my < MAP_SIZE and
-                        self.occ_map.grid_map[my, mx] not in (GREEN_CARPET, CLOSED)):
+                        self.occ_map.grid_map[my, mx] not in (GREEN_CARPET, CLOSED, OBSTACLE)):
                     self.occ_map.grid_map[my, mx] = DEPTH_OBSTACLE
             self.occ_map.build_cost_map()
             color_tag = orient if orient is not None else 'vertical'
@@ -487,12 +485,27 @@ class MyRobot(Robot):
         x1 = min(grid.shape[1], int(mx) + radius + 1)
         return bool(np.any(grid[y0:y1, x0:x1] == OBSTACLE))
 
-    def _clear_depth_cells_near_lidar_walls(self, radius=3):
+    def _clear_depth_cells_near_lidar_walls(self, radius=3,
+                                            protect_cells=None,
+                                            protect_radius=0):
         cells = getattr(self.occ_map, '_depth_obstacle_cells', set())
         if not cells:
             return
+        protected = set()
+        if protect_cells:
+            protect_radius = max(0, int(protect_radius))
+            if protect_radius == 0:
+                protected = set(protect_cells)
+            else:
+                protect_radius_sq = protect_radius * protect_radius
+                for px, py in protect_cells:
+                    for dy in range(-protect_radius, protect_radius + 1):
+                        for dx in range(-protect_radius, protect_radius + 1):
+                            if dx * dx + dy * dy <= protect_radius_sq:
+                                protected.add((int(px) + dx, int(py) + dy))
         remove = {cell for cell in cells
-                  if self._cell_near_lidar_wall(cell[0], cell[1], radius=radius)}
+                  if cell not in protected and
+                  self._cell_near_lidar_wall(cell[0], cell[1], radius=radius)}
         if not remove:
             return
         cells.difference_update(remove)
@@ -885,37 +898,96 @@ class MyRobot(Robot):
             return set(cells)
         return {(int(round(float(x))), int(round(float(y)))) for x, y in edge_pts}
 
-    def _rasterize_floating_wall_cells(self, cells, orientation=None, robot_cell=None):
-        if not cells:
-            return set()
-        cells = self._front_edge_cells(cells, robot_cell)
-        pts = np.array(list(cells), dtype=np.int32)
-        if pts.shape[0] == 1:
-            return {(int(pts[0, 0]), int(pts[0, 1]))}
+    def _rasterize_floating_plane_edges(self, cells, robot_cell):
+        pts, axis, major, minor = self._floating_cluster_stats(cells)
+        if pts.shape[0] < 4 or robot_cell is None:
+            return None
+        if minor < 1.8 or major / max(minor, 1e-3) > 4.0:
+            return None
 
-        pts_f, axis, _, _ = self._floating_cluster_stats(cells)
-        centered = pts_f - pts_f.mean(axis=0)
+        center = pts.mean(axis=0)
+        view = center - np.array(robot_cell, dtype=np.float32)
+        norm = float(np.linalg.norm(view))
+        if norm < 1e-6:
+            return None
+        view /= norm
 
-        projection = centered @ axis
-        order = np.argsort(projection)
-        pts = pts[order]
-        projection = projection[order]
+        depth = pts @ view
+        near = float(np.min(depth))
+        far = float(np.max(depth))
+        if far - near < 1.8:
+            return None
+
+        edge_band = min(1.5, max(0.75, (far - near) * 0.25))
+        near_pts = pts[depth <= near + edge_band]
+        far_pts = pts[depth >= far - edge_band]
+        if near_pts.shape[0] < 2 or far_pts.shape[0] < 2:
+            return None
 
         raster = set()
         max_gap = max(4, int(DEPTH_OBSTACLE_BRIDGE_GAP_CELLS))
+        for edge_pts in (near_pts, far_pts):
+            edge_cells = {(int(round(float(x))), int(round(float(y))))
+                          for x, y in edge_pts}
+            edge_arr = np.array(list(edge_cells), dtype=np.int32)
+            if edge_arr.shape[0] == 0:
+                continue
+            if edge_arr.shape[0] == 1:
+                raster.add((int(edge_arr[0, 0]), int(edge_arr[0, 1])))
+                continue
 
-        # Mark directly observed cells and only bridge tiny gaps between adjacent
-        # observed cells. No fitted centerline or endpoint extension is used here.
-        for x, y in pts:
-            raster.add((int(x), int(y)))
-        for i, (p0, p1) in enumerate(zip(pts[:-1], pts[1:])):
-            if projection[i + 1] - projection[i] > max_gap:
-                continue
-            if float(np.linalg.norm(p1.astype(np.float32) - p0.astype(np.float32))) > max_gap:
-                continue
-            for x, y in utils.ray_cells((int(p0[0]), int(p0[1])),
-                                        (int(p1[0]), int(p1[1]))):
-                raster.add((x, y))
+            edge_f = edge_arr.astype(np.float32)
+            projection = (edge_f - edge_f.mean(axis=0)) @ axis
+            order = np.argsort(projection)
+            edge_arr = edge_arr[order]
+            projection = projection[order]
+
+            for x, y in edge_arr:
+                raster.add((int(x), int(y)))
+            for i, (p0, p1) in enumerate(zip(edge_arr[:-1], edge_arr[1:])):
+                if projection[i + 1] - projection[i] > max_gap:
+                    continue
+                if float(np.linalg.norm(p1.astype(np.float32) - p0.astype(np.float32))) > max_gap:
+                    continue
+                for x, y in utils.ray_cells((int(p0[0]), int(p0[1])),
+                                            (int(p1[0]), int(p1[1]))):
+                    raster.add((x, y))
+
+        return raster
+
+    def _rasterize_floating_wall_cells(self, cells, orientation=None, robot_cell=None):
+        if not cells:
+            return set()
+        raster = self._rasterize_floating_plane_edges(cells, robot_cell)
+        if raster is None:
+            cells = self._front_edge_cells(cells, robot_cell)
+            pts = np.array(list(cells), dtype=np.int32)
+            if pts.shape[0] == 1:
+                return {(int(pts[0, 0]), int(pts[0, 1]))}
+
+            pts_f, axis, _, _ = self._floating_cluster_stats(cells)
+            centered = pts_f - pts_f.mean(axis=0)
+
+            projection = centered @ axis
+            order = np.argsort(projection)
+            pts = pts[order]
+            projection = projection[order]
+
+            raster = set()
+            max_gap = max(4, int(DEPTH_OBSTACLE_BRIDGE_GAP_CELLS))
+
+            # Mark directly observed cells and only bridge tiny gaps between adjacent
+            # observed cells. No fitted centerline or endpoint extension is used here.
+            for x, y in pts:
+                raster.add((int(x), int(y)))
+            for i, (p0, p1) in enumerate(zip(pts[:-1], pts[1:])):
+                if projection[i + 1] - projection[i] > max_gap:
+                    continue
+                if float(np.linalg.norm(p1.astype(np.float32) - p0.astype(np.float32))) > max_gap:
+                    continue
+                for x, y in utils.ray_cells((int(p0[0]), int(p0[1])),
+                                            (int(p1[0]), int(p1[1]))):
+                    raster.add((x, y))
 
         # Thicken the trace a little so the wall reads as a wall in the map.
         radius = max(0, int(DEPTH_OBSTACLE_STAMP_RADIUS))
