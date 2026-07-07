@@ -134,6 +134,7 @@ class MapRenderer:
             grouped = {}
             for fx, fy, orient in floating_points:
                 grouped.setdefault(orient, []).append((int(fx), int(fy)))
+            max_gap = max(6, int(DEPTH_OBSTACLE_BRIDGE_GAP_CELLS) * 3)
             for orient, pts in grouped.items():
                 col = (200, 0, 200) if orient == 'horizontal' else (0, 200, 200)
                 pts = sorted(set(pts), key=lambda p: (p[0], p[1]) if orient != 'vertical' else (p[1], p[0]))
@@ -141,6 +142,8 @@ class MapRenderer:
                     _mark(pts[0][0], pts[0][1], col, r=2)
                     continue
                 for p0, p1 in zip(pts[:-1], pts[1:]):
+                    if max(abs(p1[0] - p0[0]), abs(p1[1] - p0[1])) > max_gap:
+                        continue
                     for x, y in utils.ray_cells(p0, p1):
                         _mark(x, y, col, r=1)
 
@@ -198,7 +201,8 @@ class OccupancyGrid:
     # ── Log-odds update ───────────────────────────────────────────────────────
 
     def _apply_ray_update(self, robot_pos, lidar_pts):
-        # Floating-wall cells are owned by the depth sensor; LiDAR must not touch them.
+        # LiDAR free-space rays must not erase true floating walls, but hit
+        # endpoints can still correct depth cells that were actually normal walls.
         depth_cells = self._depth_obstacle_cells
         for pt in lidar_pts:
             cells = utils.ray_cells(robot_pos, pt)
@@ -207,11 +211,10 @@ class OccupancyGrid:
                     if (x, y) in depth_cells:
                         continue
                     if self.log_odds[y, x] < 3.5:
-                        self.log_odds[y, x] -= 0.08
+                        self.log_odds[y, x] -= 0.14
             x, y = cells[-1]
             if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE:
-                if (x, y) not in depth_cells:
-                    self.log_odds[y, x] += 1.2
+                self.log_odds[y, x] += 1.2
 
     def rebuild_grid(self):
         clipped = np.clip(self.log_odds, -5, 5)
@@ -230,9 +233,10 @@ class OccupancyGrid:
                 depth_mask[ys_d, xs_d] = True
 
         protected   = closed_mask | green_mask | depth_mask
+        wall_protected = closed_mask | green_mask
 
         unknown_mask  = (self.log_odds == INITIAL_LOG_ODD) & ~protected
-        obstacle_mask = (P > 0.85) & ~protected
+        obstacle_mask = (P > 0.96) & ~wall_protected
         free_mask     = (P < 0.42) & ~protected
 
         # Connected-component filter: drop noise blobs < 8 px
@@ -242,13 +246,18 @@ class OccupancyGrid:
         for i in range(1, n_labels):
             if stats[i, cv2.CC_STAT_AREA] >= 40:
                 clean[labels == i] = 1
-        obstacle_mask = clean.astype(bool) & ~protected
+        obstacle_mask = clean.astype(bool) & ~wall_protected
 
         self.grid_map[obstacle_mask] = OBSTACLE
         self.grid_map[free_mask]     = FREESPACE
         self.grid_map[unknown_mask]  = UNKNOWN
         self.grid_map[green_mask]    = GREEN_CARPET
         self.grid_map[closed_mask]   = CLOSED
+
+        if self._depth_obstacle_cells:
+            self._depth_obstacle_cells.difference_update(
+                (int(x), int(y)) for y, x in zip(*np.where(obstacle_mask))
+            )
 
         # Re-stamp depth-camera obstacles: lidar cannot see floating walls or very low
         # walls, so its log-odds updates would clear them. Re-applying here after every
