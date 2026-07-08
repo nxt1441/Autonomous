@@ -5,6 +5,7 @@ import cv2
 import random
 import time
 import threading
+from collections import deque
 import utils
 from CONSTANTS import *
 from map import OccupancyGrid
@@ -46,17 +47,45 @@ class MyRobot(Robot):
         self.estimation_distance_threshold = 0.5
         self.last_found_color = None
         self.last_found_point = None
-        self.last_floating_wall_orientation = None
+        self.first_found_color = None
+        # Floating-wall detection: height-band marking with confirmed,
+        # frustum-gated persistence (see _refresh_map_depth). Every point
+        # `_depth_obstacle_points_local` returns already lies inside the
+        # robot-blocking height band [GROUND_EPSILON_M, ROBOT_CLEARANCE_HEIGHT_M]
+        # by construction, so there is no separate "is it low enough to
+        # block" decision left to make — every map cell the depth camera
+        # (or the IR short-range backstop) ever reports here casts a vote;
+        # a cell is only trusted and drawn once it has
+        # FLOATING_WALL_CONFIRM_VOTES independent votes, and from that
+        # point on it is frozen in position (never re-fit, never moved) and
+        # can only leave the map via the much stricter frustum-gated
+        # clearing pass (_frustum_clear_floating), never by simple
+        # per-frame reclassification.
+        self._floating_votes = {}
+        self._floating_confirmed = set()
+        # Contradiction counter for frustum-gated clearing: how many
+        # distinct frames have shown the camera's own line of sight passing
+        # clean through a confirmed cell to something farther away. Reset
+        # whenever the cell is NOT contradicted; the cell is only removed
+        # once this reaches DEPTH_CLEAR_CONFIRMATIONS (see
+        # _frustum_clear_floating) — clearing is deliberately much harder
+        # to trigger than marking.
+        self._floating_clear_votes = {}
+        # Union-find over confirmed cells: cells belonging to the same
+        # physical wall (touching or bridged together) share one root. Used
+        # only to close interior/seam gaps (_floating_solidify_group,
+        # _floating_bridge_gap) — every confirmed cell already blocks the
+        # robot on its own, so no per-group verdict is needed any more.
+        self._floating_group = {}         # cell -> parent cell (path-compressed)
+        self._floating_group_members = {} # root cell -> set of member cells
 
-        self.last_closure_time = 0.0
-        self.closure_cooldown  = CLOSURE_MARK_COOLDOWN
-
-        self.steps_since_turning  = DEPTH_OBSTACLE_POST_TURN_STABILIZATION_STEPS
+        self.steps_since_turning  = 0
         self.is_currently_turning = False
 
         self.detection_thread        = None
         self.camera_thread_running   = False
         self.camera_detection_signal = None
+        self.camera_detection_queue  = deque(maxlen=6)
         self.detection_lock          = threading.Lock()
 
         self.lidar_thread        = None
@@ -69,6 +98,7 @@ class MyRobot(Robot):
         self._rt_active_path     = None   # path currently being followed (written by nav)
         self._rt_new_path        = None   # freshly replanned path (written by planner)
         self._rt_replan_ready    = False  # True when _rt_new_path is ready to consume
+        self._rt_last_replan_time = 0.0
         self._rt_planner_lock    = threading.Lock()
 
         self.stuck_thread        = None
@@ -83,8 +113,22 @@ class MyRobot(Robot):
         self.follow_target_stuck_threshold    = 25
         self._phys_stuck_count                = 0
         self._last_scan_fp                    = None  # LiDAR fingerprint for slip detection
+        self._scan_stuck_count                = 0
+        self._waypoint_motion_commanded       = False
+        self._last_cmd_left                   = 0.0
+        self._last_cmd_right                  = 0.0
+        self._dwa_no_motion_count             = 0
         self._robot_trail                     = set() # coarsened path history for frontier anti-revisit
         self._last_frontier_goal              = None  # last successfully reached frontier centroid
+        self._active_frontier_goal            = None
+        self._column_focus_color              = None
+        self._column_focus_target             = None
+        self._column_focus_blocked_until      = {}
+        self._last_column_signal_time         = 0.0
+        self._last_column_signal_color        = None
+        self._last_detection_emit             = {}
+        self._last_detection_handled          = {}
+        self._camera_seen_counts              = {}
 
         try:
             self.cam_width   = self.camera_rgb.getWidth()
@@ -100,13 +144,58 @@ class MyRobot(Robot):
             self.fx = self.fy = 240.0
             self.cx, self.cy = 160.0, 120.0
 
-        self.camera_height_m  = 0.17
-        self.camera_pitch_rad = 0.0
-        self.X_offset = 0.03
-        self.Y_offset = 0.0
+        # Sensor mount extrinsics, derived from the actual Webots proto chain
+        # (Rosbot.proto -> Astra.proto / RpLidarA2.proto), relative to the
+        # robot's own local origin — the same origin the wheel-encoder
+        # odometry (_odom_x/_odom_y) tracks. These are composed poses, not a
+        # single translation: Rosbot.proto mounts the Astra HOUSING at
+        # (-0.027, 0, 0.165), but the RangeFinder ("camera depth") element
+        # inside Astra.proto has its own local offset of (0.027, 0.037,
+        # 0.034) relative to that housing. Composing them:
+        #   X = -0.027 + 0.027 = 0.000   (the -0.027 housing offset and the
+        #                                 +0.027 internal offset cancel — the
+        #                                 depth sensor sits exactly on the
+        #                                 robot's forward centerline)
+        #   Y =  0.000 + 0.037 = 0.037   (offset sideways — previously assumed
+        #                                 zero, which is wrong)
+        #   Z =  0.165 + 0.034 = 0.199   (not the housing's own 0.165)
+        # Using the housing translation alone (as an earlier pass here did,
+        # with X_offset=-0.027) still left a real bias: any forward/lateral
+        # offset error, expressed in the robot's frame, lands in a different
+        # world (x,y) position depending on the robot's heading when rotated
+        # into world coordinates — which looks exactly like a residual
+        # per-viewing-angle "angle" error even after the PCA/cardinal-snap
+        # fix and the earlier (wrong) X_offset correction.
+        self.camera_height_m  = 0.199
+        # Refined once at runtime by _calibrate_camera_height() from real
+        # floor pixels — the proto composition above is the starting point,
+        # but manufacturing/mount tolerance can still leave a residual bias
+        # that only an empirical floor measurement can remove.
+        self._camera_height_calibrated = False
+        self.camera_pitch_rad = 0.0     # Astra mount rotation is identity
+        self.X_offset = 0.0
+        self.Y_offset = 0.037
+        # RpLidarA2.proto's own default `translation` field is (0, 0, 0.031),
+        # composed with Rosbot.proto's lidarSlot pose (0.02, 0, 0.1). Only Z
+        # is affected (0.1 + 0.031 = 0.131) and the lidar's 2D point cloud
+        # doesn't carry height, so X/Y are unaffected by that inner offset.
+        self.LIDAR_X_OFFSET = 0.02      # RpLidarA2 translation x
+        self.LIDAR_Y_OFFSET = 0.0       # RpLidarA2 translation y
+        # Front IR range sensors (Rosbot.proto DistanceSensor nodes fl_range/
+        # fr_range): mounted at x=0.10, y=+-0.05, z=0.053 m in the chassis
+        # frame, yawed +-0.13 rad outward. Height 0.053 m sits inside the
+        # floating-wall band (DEPTH_OBSTACLE_FLOATING_MIN/MAX_HEIGHT), and
+        # unlike the Astra depth camera these read down to near 0 m — used
+        # only to cover the depth camera's own blind gap below its minRange
+        # (DEPTH_CAMERA_MIN_RANGE_M), see _ir_floating_wall_points_local.
+        self.IR_FRONT_MOUNTS = (
+            (0.10, 0.05, 0.130),
+            (0.10, -0.05, -0.130),
+        )
+        self.IR_RANGE_HEIGHT_M = 0.053
 
         self.green_carpet_patches             = []
-        self.green_carpet_proximity_threshold = 200.0
+        self.green_carpet_proximity_threshold = GREEN_CARPET_PATCH_PROXIMITY_CELLS
         self.last_green_mark_time  = 0.0
         self.green_mark_cooldown   = 8.0
         self.last_green_carpet_points = []
@@ -121,30 +210,18 @@ class MyRobot(Robot):
         self._odom_prev_left  = 0.0
         self._odom_prev_right = 0.0
         self._odom_initialized = False
-        self._last_odom_step_distance = 0.0
-        self._last_odom_step_heading_delta = 0.0
-        # Temporal counters for confirming observed depth-only obstacles
-        self._depth_cell_counters = {}
+        self._step_lock = threading.RLock()
 
     # ── step() override ───────────────────────────────────────────────────────
 
     def step(self, duration_ms=None):
         if duration_ms is None:
             duration_ms = self.time_step
-        result = super().step(int(duration_ms))
-        if result != -1:
-            self._tick_odometry()
-            turning_now = self.is_turning()
-            if turning_now:
-                self.is_currently_turning = True
-                self.steps_since_turning = 0
-            else:
-                if self.is_currently_turning:
-                    self.is_currently_turning = False
-                    self.steps_since_turning = 0
-                else:
-                    self.steps_since_turning += 1
-        return result
+        with self._step_lock:
+            result = super().step(int(duration_ms))
+            if result != -1:
+                self._tick_odometry()
+            return result
 
     # ── Odometry ──────────────────────────────────────────────────────────────
 
@@ -169,29 +246,13 @@ class MyRobot(Robot):
         self._odom_prev_left  = left_enc
         self._odom_prev_right = right_enc
 
-        ds         = (dl + dr) / 2.0
-        prev_theta = self._odom_theta
+        ds          = (dl + dr) / 2.0
+        prev_theta  = self._odom_theta
         self._odom_theta = heading
-        dtheta     = utils.angle_wrap(self._odom_theta, prev_theta)
+        mid_theta   = (prev_theta + self._odom_theta) / 2.0
 
-        self._last_odom_step_distance      = float(abs(ds))
-        self._last_odom_step_heading_delta = float(abs(dtheta))
-
-        # Skip sub-millimetre ticks to prevent noise accumulation when stationary.
-        if abs(ds) < 1e-4:
-            return
-
-        # Exact arc formula for differential drive.
-        # compass supplies absolute heading so there is no heading drift;
-        # this formula is strictly more accurate than the mid-theta linear
-        # approximation, especially during turns.
-        if abs(dtheta) < 1e-6:
-            self._odom_x += ds * math.cos(self._odom_theta)
-            self._odom_y += ds * math.sin(self._odom_theta)
-        else:
-            R = ds / dtheta
-            self._odom_x += R * (math.sin(self._odom_theta) - math.sin(prev_theta))
-            self._odom_y += R * (-math.cos(self._odom_theta) + math.cos(prev_theta))
+        self._odom_x = self._odom_x + ds * math.cos(mid_theta)
+        self._odom_y = self._odom_y + ds * math.sin(mid_theta)
         # Record coarsened position for frontier anti-revisit
         half = MAP_SIZE // 2
         _mx = half + int(self._odom_x / RESOLUTION)
@@ -210,8 +271,8 @@ class MyRobot(Robot):
 
     def get_map_position(self):
         half = self.occ_map.map_size // 2
-        mx = half + int(np.rint(self._odom_x / RESOLUTION))
-        my = half - int(np.rint(self._odom_y / RESOLUTION))
+        mx = half + int(self._odom_x / RESOLUTION)
+        my = half - int(math.ceil(self._odom_y / RESOLUTION))
         return np.array([mx, my])
 
     def get_map_distance(self, map_target):
@@ -219,8 +280,8 @@ class MyRobot(Robot):
 
     def convert_to_map_coordinates(self, x, y):
         half = self.occ_map.map_size // 2
-        mx   = half + int(np.rint(x / RESOLUTION))
-        my   = half - int(np.rint(y / RESOLUTION))
+        mx   = half + int(x / RESOLUTION)
+        my   = half - int(math.ceil(y / RESOLUTION))
         return int(mx), int(my)
 
     def convert_to_world_coordinates(self, mx, my):
@@ -232,19 +293,6 @@ class MyRobot(Robot):
     def convert_to_map_coordinate_matrix(self, pts_world):
         return self.occ_map.world_pts_to_map(pts_world)
 
-    def position_ahead(self, distance_m):
-        h = self.get_heading('rad')
-        return np.array([self._odom_x + distance_m * np.cos(h),
-                         self._odom_y + distance_m * np.sin(h)])
-
-    def get_angle_diff(self, map_target, kind='deg'):
-        heading     = self.get_heading('rad')
-        mx, my      = self.get_map_position()
-        target_ang  = np.arctan2(map_target[1] - my, map_target[0] - mx)
-        diff        = abs(target_ang - heading)
-        if diff > np.pi:
-            diff = 2 * np.pi - diff
-        return diff if kind == 'rad' else np.degrees(diff)
 
     # ── Ground check ──────────────────────────────────────────────────────────
 
@@ -261,6 +309,8 @@ class MyRobot(Robot):
     def stop_motor(self):
         for m in self.motors.values():
             m.setVelocity(0.0)
+        self._last_cmd_left = 0.0
+        self._last_cmd_right = 0.0
 
     def set_robot_velocity(self, left, right):
         left  = max(-MAX_VELOCITY, min(MAX_VELOCITY, left))
@@ -273,6 +323,17 @@ class MyRobot(Robot):
             self.last_turn = 'left'
         elif right < left:
             self.last_turn = 'right'
+
+    def _set_path_velocity(self, left, right, alpha=0.55):
+        left = alpha * left + (1.0 - alpha) * self._last_cmd_left
+        right = alpha * right + (1.0 - alpha) * self._last_cmd_right
+        if abs(left) < 0.12:
+            left = 0.0
+        if abs(right) < 0.12:
+            right = 0.0
+        self.set_robot_velocity(left, right)
+        self._last_cmd_left = left
+        self._last_cmd_right = right
 
     def velocity_to_wheel_speeds(self, v, w):
         half = self.axle_length / 2.0
@@ -296,23 +357,6 @@ class MyRobot(Robot):
         self.step(ms)
         self.stop_motor()
 
-    def move_backward_milisecond(self, ms=300):
-        self.set_robot_velocity(MOTOR_VELOCITY_BACKWARD, MOTOR_VELOCITY_BACKWARD)
-        self.step(ms)
-        self.stop_motor()
-
-    def turn_degrees(self, degrees, direction='right'):
-        rad_target    = np.deg2rad(degrees)
-        start_heading = self.get_heading('rad')
-        if direction == 'right':
-            self.set_robot_velocity(MOTOR_VELOCITY_TURN, -MOTOR_VELOCITY_TURN)
-        else:
-            self.set_robot_velocity(-MOTOR_VELOCITY_TURN, MOTOR_VELOCITY_TURN)
-        while self.step(self.time_step) != -1:
-            turned = abs(utils.angle_wrap(self.get_heading('rad'), start_heading))
-            if turned >= rad_target - TURN_ANGLE_COMPLETION_THRESHOLD:
-                break
-        self.stop_motor()
 
     # ── LiDAR helpers ─────────────────────────────────────────────────────────
 
@@ -323,7 +367,15 @@ class MyRobot(Robot):
         if not pts:
             return np.array([])
         arr = np.array([[p.x, p.y] for p in pts], dtype=np.float32)
-        return arr[~np.isinf(arr).any(axis=1)]
+        arr = arr[~np.isinf(arr).any(axis=1)]
+        if len(arr) == 0:
+            return arr
+        # Points come back in the lidar's own sensor frame; shift into the
+        # robot's local (odometry-origin) frame by the lidar's mount offset
+        # before any caller rotates/translates them into world coordinates.
+        arr[:, 0] += self.LIDAR_X_OFFSET
+        arr[:, 1] += self.LIDAR_Y_OFFSET
+        return arr
 
     def transform_points_to_world(self, pts_local):
         if len(pts_local) == 0:
@@ -333,8 +385,6 @@ class MyRobot(Robot):
                       [np.sin(theta),  np.cos(theta)]])
         return pts_local @ R.T + np.array([self._odom_x, self._odom_y])
 
-    def get_pointcloud_world_coordinates(self):
-        return self.transform_points_to_world(self.get_pointcloud_2d())
 
     def get_lidar_front_min_dist(self, angle_range_deg=30):
         pts = self.get_pointcloud_2d()
@@ -346,19 +396,19 @@ class MyRobot(Robot):
         front  = dists[(angles > -lim) & (angles < lim)]
         return float(np.min(front)) if len(front) > 0 else float('inf')
 
-    def get_min_front_distance(self, angle_deg=None):
-        if angle_deg is None:
-            angle_deg = LIDAR_FRONT_CONE_ANGLE
+    def _lidar_min_dist_at_bearing(self, bearing_rad, angle_range_deg=8):
+        """Nearest LiDAR hit within a narrow angular window around an
+        arbitrary bearing (not just straight ahead)."""
         pts = self.get_pointcloud_2d()
-        if pts.shape[0] == 0:
-            ds = self.get_distances()
-            return float(min(ds[0], ds[2])) if len(ds) >= 3 else float('inf')
-        angles = np.arctan2(pts[:, 1], pts[:, 0]) * 180.0 / np.pi
-        front  = pts[(angles > -angle_deg) & (angles < angle_deg)]
-        if front.shape[0] == 0:
-            ds = self.get_distances()
-            return float(min(ds[0], ds[2])) if len(ds) >= 3 else float('inf')
-        return float(np.min(np.linalg.norm(front, axis=1)))
+        if len(pts) == 0:
+            return float('inf')
+        angles = np.arctan2(pts[:, 1], pts[:, 0])
+        dists  = np.linalg.norm(pts, axis=1)
+        lim    = np.radians(angle_range_deg)
+        diff   = np.abs(((angles - bearing_rad + np.pi) % (2 * np.pi)) - np.pi)
+        sector = dists[diff < lim]
+        return float(np.min(sector)) if len(sector) > 0 else float('inf')
+
 
     def _get_scan_fp(self, sectors=12):
         """Return per-sector minimum LiDAR distances (robot frame).
@@ -387,76 +437,503 @@ class MyRobot(Robot):
         except Exception:
             return None
 
+    def _scan_delta(self, a, b):
+        if a is None or b is None:
+            return None
+        finite = np.isfinite(a) & np.isfinite(b)
+        if not np.any(finite):
+            return None
+        return float(np.mean(np.abs(a[finite] - b[finite])))
+
     def _refresh_map_lidar(self):
-        pts     = self.get_pointcloud_world_coordinates()
+        pts_local = self.get_pointcloud_2d()
+        if pts_local.shape[0] == 0:
+            return
+        dists = np.linalg.norm(pts_local, axis=1)
+        valid = (dists >= 0.05) & np.isfinite(dists)
+        pts_local = pts_local[valid]
+        if pts_local.shape[0] == 0:
+            return
+        pts     = self.transform_points_to_world(pts_local)
         map_pos = self.get_map_position()
         self.occ_map.process_scan(map_pos, pts)
 
-    def _refresh_map_depth(self, depth_stride=3, max_depth=5.0):
-        """Process depth-camera obstacles and plot floating walls.
-        Behaviour inspired by Maze1: detect floating-wall points (require_ground_support=True)
-        and fall back to general depth obstacles otherwise. Floating walls are stored
-        in occ_map.floating_points for visualization (orientation classified).
+    def _ir_floating_wall_points_local(self):
+        """Cover the Astra depth camera's own blind gap: it cannot report
+        ANY depth closer than DEPTH_CAMERA_MIN_RANGE_M (Astra.proto's
+        RangeFinder.minRange), so a floating wall the robot has approached
+        closer than that simply vanishes from `_depth_obstacle_points_local`
+        every frame, regardless of tuning. The front IR range sensors read
+        down to near 0 m and cover exactly this gap.
+
+        A close IR hit is only trusted as a floating-wall sighting if the
+        LiDAR looking along that same bearing reports the ground-level
+        space beyond it as clear — that combination (something close at IR
+        height, nothing at floor height) is the signature of a panel whose
+        underside the IR beam grazed but whose base never reaches the
+        floor, as opposed to a normal wall or the maze's own perimeter,
+        which LiDAR would already be reporting solidly.
+        """
+        if not self.distance_sensors or len(self.distance_sensors) < 3:
+            return np.empty((0, 3), dtype=np.float32)
+        try:
+            fl_val = float(self.distance_sensors[0].getValue())
+            fr_val = float(self.distance_sensors[2].getValue())
+        except Exception:
+            return np.empty((0, 3), dtype=np.float32)
+
+        pts = []
+        for dist, (mx, my, myaw) in zip((fl_val, fr_val), self.IR_FRONT_MOUNTS):
+            if not np.isfinite(dist) or dist <= 0.01 or dist >= DEPTH_CAMERA_MIN_RANGE_M:
+                continue
+            px = mx + dist * math.cos(myaw)
+            py = my + dist * math.sin(myaw)
+            beam_len = math.hypot(px, py)
+            bearing = math.atan2(py, px)
+            ground_clear = self._lidar_min_dist_at_bearing(bearing)
+            if ground_clear <= beam_len + 0.05:
+                continue  # LiDAR sees something solid there too — not floating
+            pts.append((px, py, self.IR_RANGE_HEIGHT_M))
+        if not pts:
+            return np.empty((0, 3), dtype=np.float32)
+        return np.array(pts, dtype=np.float32)
+
+    def _refresh_map_depth(self, depth_stride=2, max_depth=3.5):
+        """Height-band marking with confirmed, frustum-gated persistence.
+
+        depth_stride=2 (not 3): a floating wall that is narrow in the
+        camera's HORIZONTAL field of view — e.g. one oriented so the robot
+        sees mostly its edge rather than its full face — can project onto
+        only a handful of image columns even at moderate range. A stride-3
+        sample grid can step over that entire narrow column run on every
+        single frame (always landing between it, never on it) for as long
+        as the relative geometry stays similar, so it collects effectively
+        zero votes no matter how many frames go by. Denser sampling makes
+        that systematic miss far less likely; this pipeline is now fully
+        vectorized (no more per-pixel Python loop), so the extra samples
+        cost little.
+
+        `_depth_obstacle_points_local` already restricts every point it
+        returns to the robot-blocking height band, so every point seen here
+        is a collision hazard by construction (Nav2 ObstacleLayer / STVL
+        style — see the module-level docs). Each frame only casts one vote
+        per map cell that band covers; a cell is not drawn or acted on
+        until it has FLOATING_WALL_CONFIRM_VOTES independent votes, and
+        from that point on it is frozen in position — this function never
+        re-fits a line through it, never redraws it, and never moves it.
+        It can only leave the map via the much stricter frustum-gated
+        `_frustum_clear_floating` pass below, never by simple per-frame
+        reclassification.
         """
         if self.camera_depth is None:
             return
-        # First try to get floating-wall points (require_ground_support=True)
-        pts_local = self._depth_obstacle_points_local(pixel_stride=depth_stride,
-                                                     max_depth=max_depth,
-                                                     require_ground_support=True)
-        if pts_local is None:
-            return
-        heading = self.get_heading('rad')
-        rmap    = self.get_map_position()
-        rx_m, ry_m = int(rmap[0]), int(rmap[1])
-        R = np.array([[np.cos(heading), -np.sin(heading)],
-                      [np.sin(heading),  np.cos(heading)]])
+        if not self._camera_height_calibrated:
+            self._calibrate_camera_height()
 
-        # If floating points detected, process and mark them specially
+        pts_local = self._depth_obstacle_points_local(pixel_stride=depth_stride,
+                                                       max_depth=max_depth)
+        # Supplement with IR-sensor sightings for whatever the depth camera's
+        # own minimum-range blind gap missed (see _ir_floating_wall_points_local).
+        # This only ADDS candidate points that flow into the exact same
+        # vote/confirm/freeze/bridge pipeline below — nothing about how an
+        # already-confirmed cell is drawn or classified changes.
+        ir_pts = self._ir_floating_wall_points_local()
+        if ir_pts.shape[0] > 0:
+            pts_local = np.concatenate([pts_local, ir_pts], axis=0) if pts_local.shape[0] > 0 else ir_pts
+
+        heading = self.get_heading('rad')
+
         if pts_local.shape[0] > 0:
+            R = np.array([[np.cos(heading), -np.sin(heading)],
+                          [np.sin(heading),  np.cos(heading)]])
             pts_world = pts_local[:, :2] @ R.T + np.array([self._odom_x, self._odom_y])
             map_pts = self.convert_to_map_coordinate_matrix(pts_world)
-            if map_pts.shape[0] == 0:
-                return
 
-            h, w = self.occ_map.grid_map.shape
-            hit_mask = np.zeros((h, w), dtype=np.uint8)
+            grid = self.occ_map.grid_map
+            h, w = grid.shape
+
+            veto_r = FLOATING_WALL_NEAR_LIDAR_VETO_CELLS
+            candidate_cells = set()
             for mx, my in map_pts:
                 mx_i, my_i = int(mx), int(my)
-                if 0 <= mx_i < w and 0 <= my_i < h:
-                    hit_mask[my_i, mx_i] = 1
-            ys, xs = np.where(hit_mask > 0)
-            map_pts = np.stack([xs, ys], axis=1).astype(np.int32) if len(xs) else np.empty((0, 2), dtype=np.int32)
+                if not (0 <= mx_i < w and 0 <= my_i < h):
+                    continue
+                # Never overlay a floating reading on ground truth that
+                # lidar or colour detection has already solidly established.
+                if grid[my_i, mx_i] in (OBSTACLE, GREEN_CARPET, CLOSED):
+                    continue
+                # Nor within a small radius of an already-confirmed LiDAR
+                # wall: the depth camera's own position error over distance
+                # can place a real, LiDAR-visible wall's computed position a
+                # cell or two off from where LiDAR fixed it -- close enough
+                # that it is clearly the same physical wall, not a separate
+                # floating one, and should defer entirely to LiDAR's fix
+                # rather than getting voted in nearby under the wrong label.
+                y0, y1 = max(0, my_i - veto_r), min(h, my_i + veto_r + 1)
+                x0, x1 = max(0, mx_i - veto_r), min(w, mx_i + veto_r + 1)
+                if np.any(grid[y0:y1, x0:x1] == OBSTACLE):
+                    continue
+                candidate_cells.add((mx_i, my_i))
 
-            unique_set = set((int(mx), int(my)) for mx, my in map_pts
-                             if 0 <= int(mx) < MAP_SIZE and 0 <= int(my) < MAP_SIZE)
-            filtered_set = set()
-            grid = self.occ_map.grid_map
-            for mx, my in unique_set:
-                if grid[my, mx] not in (GREEN_CARPET, CLOSED):
-                    filtered_set.add((mx, my))
-            if not filtered_set:
-                self.occ_map.floating_points = []
-                return
-            # Register in the persistent depth-obstacle set so rebuild_grid (triggered by
-            # every lidar scan) cannot erase them — lidar passes under/over these walls.
-            self.occ_map._depth_obstacle_cells.update(filtered_set)
-            # Mark immediately in the live grid as well
-            for mx, my in filtered_set:
-                self.occ_map.grid_map[my, mx] = DEPTH_OBSTACLE
+            newly_confirmed = set()
+            for cell in candidate_cells:
+                if cell in self._floating_confirmed:
+                    continue
+                votes = self._floating_votes.get(cell, 0) + 1
+                self._floating_votes[cell] = min(votes, FLOATING_WALL_VOTE_CAP)
+                if self._floating_votes[cell] >= FLOATING_WALL_CONFIRM_VOTES:
+                    newly_confirmed.add(cell)
+
+            for cell in newly_confirmed:
+                self._floating_confirmed.add(cell)
+                self._floating_group[cell] = cell
+                self._floating_group_members[cell] = {cell}
+                self._floating_merge_touching(cell)
+                self._floating_bridge_gap(cell)
+                self._floating_solidify_group(self._floating_find(cell))
+
+        self._frustum_clear_floating(heading)
+
+        # A cell can end up here that LiDAR has since independently
+        # confirmed as a real, grounded OBSTACLE for that SAME cell, or for
+        # one immediately next to it (map.py's rebuild_grid lets LiDAR's
+        # own strong evidence win for an exact-cell match; the small-radius
+        # check here catches the same physical wall being confirmed one
+        # cell over, from the camera's own position error over distance —
+        # see FLOATING_WALL_NEAR_LIDAR_VETO_CELLS). Once that happens it is
+        # an ordinary wall, not a floating one — drop it from floating-wall
+        # bookkeeping entirely so it renders as a normal wall, not red.
+        grid = self.occ_map.grid_map
+        gh, gw = grid.shape
+        veto_r = FLOATING_WALL_NEAR_LIDAR_VETO_CELLS
+        lidar_owned = set()
+        for c in self._floating_confirmed:
+            cx, cy = c
+            y0, y1 = max(0, cy - veto_r), min(gh, cy + veto_r + 1)
+            x0, x1 = max(0, cx - veto_r), min(gw, cx + veto_r + 1)
+            if np.any(grid[y0:y1, x0:x1] == OBSTACLE):
+                lidar_owned.add(c)
+        if lidar_owned:
+            for cell in lidar_owned:
+                self._floating_confirmed.discard(cell)
+                self._floating_votes.pop(cell, None)
+                self._floating_clear_votes.pop(cell, None)
+                root = self._floating_find(cell)
+                members = self._floating_group_members.get(root)
+                if members is not None:
+                    members.discard(cell)
+                self._floating_group.pop(cell, None)
+
+        if not self._floating_confirmed:
+            self.occ_map.floating_points = []
             self.occ_map.build_cost_map()
-            orient = self._classify_floating_wall(pts_local)
-            color_tag = orient if orient is not None else 'vertical'
-            self.occ_map.floating_points = [(mx, my, color_tag) for mx, my in filtered_set]
             return
 
-        # No floating-wall points: do not plot any depth obstacles.
+        for mx, my in self._floating_confirmed:
+            if grid[my, mx] not in (GREEN_CARPET, CLOSED):
+                grid[my, mx] = DEPTH_OBSTACLE
+        self.occ_map._depth_obstacle_cells = set(self._floating_confirmed)
+        self.occ_map.floating_points = [(mx, my, 'blocking') for mx, my in self._floating_confirmed]
+        self.occ_map.build_cost_map()
+
+    def _frustum_clear_floating(self, heading):
+        """Frustum-gated clearing (STVL: marking and clearing are different
+        decisions with different evidence requirements — clearing must be
+        much harder to trigger). A confirmed cell only loses ground when
+        the camera's OWN current line of sight demonstrably passes clean
+        through it to something farther away, inside the camera's valid
+        range and FOV — never from LiDAR (which is blind at this height
+        band by definition) and never for a cell inside or near the depth
+        camera's 0.6 m blind zone, where the camera simply has no evidence
+        either way. Even then, a single contradicting frame only increments
+        a per-cell counter; removal requires DEPTH_CLEAR_CONFIRMATIONS
+        distinct contradicting frames, and any frame that does NOT
+        contradict a cell resets its counter back to zero."""
+        if not self._floating_confirmed or self.camera_depth is None:
+            return
+        frame = self._get_depth_frame()
+        if frame is None:
+            return
+        depth_arr, fx, fy, cx, cy, w, h = frame
+        cos_h, sin_h = math.cos(heading), math.sin(heading)
+        fov_half = math.atan2(w / 2.0, fx)
+
+        to_remove = set()
+        for cell in list(self._floating_confirmed):
+            wx, wy = self.convert_to_world_coordinates(*cell)
+            dx, dy = wx - self._odom_x, wy - self._odom_y
+            fwd = dx * cos_h + dy * sin_h
+            lat = -dx * sin_h + dy * cos_h
+            if not (DEPTH_CLEAR_MIN_RANGE_M < fwd < 3.5):
+                continue  # outside the valid, non-blind range: no evidence
+            bearing = math.atan2(lat, fwd)
+            if abs(bearing) > fov_half * 0.9:
+                continue  # outside FOV (with a small border margin)
+            u = int(round(cx + math.tan(bearing) * fx))
+            if not (0 <= u < w):
+                continue
+            col = depth_arr[:, u]
+            valid_rows = np.isfinite(col) & (col > 0.05) & (col < max(3.5, fwd + 0.5))
+            if not np.any(valid_rows):
+                continue
+            nearest = float(np.min(col[valid_rows]))
+            if nearest > fwd + 0.10:
+                # Line of sight demonstrably passes through/beyond where
+                # this cell should be — contradicting evidence.
+                votes = self._floating_clear_votes.get(cell, 0) + 1
+                self._floating_clear_votes[cell] = votes
+                if votes >= DEPTH_CLEAR_CONFIRMATIONS:
+                    to_remove.add(cell)
+            else:
+                self._floating_clear_votes.pop(cell, None)
+
+        if not to_remove:
+            return
+        grid = self.occ_map.grid_map
+        for cell in to_remove:
+            self._floating_clear_votes.pop(cell, None)
+            self._floating_confirmed.discard(cell)
+            root = self._floating_find(cell)
+            members = self._floating_group_members.get(root)
+            if members is not None:
+                members.discard(cell)
+            self._floating_group.pop(cell, None)
+            self._floating_votes.pop(cell, None)
+            mx, my = cell
+            if grid[my, mx] == DEPTH_OBSTACLE:
+                grid[my, mx] = FREESPACE
+        self.occ_map._depth_obstacle_cells.difference_update(to_remove)
+
+    def _floating_find(self, cell):
+        """Union-find root lookup with path compression."""
+        parent = self._floating_group.get(cell, cell)
+        if parent == cell:
+            return cell
+        root = self._floating_find(parent)
+        self._floating_group[cell] = root
+        return root
+
+    def _floating_union(self, a, b):
+        ra, rb = self._floating_find(a), self._floating_find(b)
+        if ra == rb:
+            return ra
+        members = self._floating_group_members.pop(ra, {ra}) | self._floating_group_members.pop(rb, {rb})
+        self._floating_group[rb] = ra
+        self._floating_group_members[ra] = members
+        return ra
+
+    def _floating_merge_touching(self, cell):
+        """Union a newly confirmed cell with any already-confirmed cell it
+        directly touches (8-connected), so gap-bridging/solidify treat one
+        physical wall as one connected group instead of many disjoint dots."""
+        cx, cy = cell
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                neighbor = (cx + dx, cy + dy)
+                if neighbor in self._floating_confirmed:
+                    self._floating_union(cell, neighbor)
+
+    def _floating_bridge_gap(self, cell):
+        """Close the space between a newly confirmed cell and whatever
+        structure sits within FLOATING_WALL_BRIDGE_RADIUS_CELLS of it — a
+        lidar wall/CLOSED cell, or another confirmed floating-wall cell not
+        already directly touching it. This covers two distinct real gaps at
+        once: (1) a genuine seam where this floating wall meets the next
+        wall or floating wall, and (2) a hole *inside* one physical wall
+        where depth-camera sampling simply hasn't confirmed every cell yet
+        (stride/occlusion) even though flanking cells of the same object
+        are already confirmed. Both cases render as a small strip of
+        unknown/free space the planner would otherwise slip through, so
+        both get bridged the same way: fill the straight-line gap and merge
+        into one connected wall."""
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        cx, cy = cell
+        r = FLOATING_WALL_BRIDGE_RADIUS_CELLS
+        best, best_d2, best_is_floating = None, None, False
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                d2 = dx * dx + dy * dy
+                if d2 == 0 or d2 > r * r:
+                    continue
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < w and 0 <= ny < h):
+                    continue
+                target = (nx, ny)
+                is_floating = target in self._floating_confirmed
+                if is_floating and self._floating_find(target) == self._floating_find(cell):
+                    continue  # already the same connected wall
+                is_hard_wall = grid[ny, nx] in (OBSTACLE, CLOSED)
+                if not (is_floating or is_hard_wall):
+                    continue
+                if best_d2 is None or d2 < best_d2:
+                    best_d2, best, best_is_floating = d2, target, is_floating
+        if best is None:
+            return
+        bridge_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.line(bridge_mask, (cx, cy), best, 1, thickness=1)
+        bys, bxs = np.where(bridge_mask > 0)
+        bridge_cells = set(zip(bxs.tolist(), bys.tolist())) - {cell, best}
+        for bc in bridge_cells:
+            if bc not in self._floating_confirmed:
+                self._floating_confirmed.add(bc)
+                self._floating_group[bc] = bc
+                self._floating_group_members[bc] = {bc}
+                self._floating_union(bc, cell)
+        if best_is_floating:
+            self._floating_union(cell, best)
+
+    def _floating_solidify_group(self, root):
+        """Close any remaining interior gap in an already-established wall
+        group by filling straight between its own confirmed members —
+        independently per row and per column, so an L-shaped group (two
+        real walls meeting at a corner) gets each arm filled correctly
+        instead of one diagonal line cutting across the corner.
+
+        This is why a floating wall that is only ever sampled sparsely
+        (a handful of cells scattered along its true run, e.g. because the
+        robot only ever saw it from close range where the depth camera's
+        stride sampling missed most of the interior) still ends up as one
+        solid, gap-free span: as soon as ANY two cells of the same physical
+        wall are confirmed, the entire straight run between them is filled
+        in immediately, without needing every individual cell in between to
+        independently reach FLOATING_WALL_CONFIRM_VOTES on its own."""
+        members = self._floating_group_members.get(root)
+        if not members or len(members) < 2:
+            return
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        by_row, by_col = {}, {}
+        for (x, y) in members:
+            by_row.setdefault(y, []).append(x)
+            by_col.setdefault(x, []).append(y)
+
+        added = set()
+        for y, xs in by_row.items():
+            if len(xs) < 2:
+                continue
+            x0, x1 = min(xs), max(xs)
+            if x1 - x0 > FLOATING_WALL_MAX_SOLIDIFY_SPAN_CELLS:
+                continue
+            for x in range(x0, x1 + 1):
+                if 0 <= x < w and (x, y) not in members:
+                    added.add((x, y))
+        for x, ys in by_col.items():
+            if len(ys) < 2:
+                continue
+            y0, y1 = min(ys), max(ys)
+            if y1 - y0 > FLOATING_WALL_MAX_SOLIDIFY_SPAN_CELLS:
+                continue
+            for y in range(y0, y1 + 1):
+                if 0 <= y < h and (x, y) not in members:
+                    added.add((x, y))
+
+        for cell in added:
+            self._floating_confirmed.add(cell)
+            self._floating_group[cell] = root
+            members.add(cell)
+
+    def _reset_transient_depth_obstacles(self):
+        cells = getattr(self.occ_map, '_depth_obstacle_cells', set())
+        if cells:
+            for mx, my in list(cells):
+                if (0 <= mx < self.occ_map.grid_map.shape[1] and
+                        0 <= my < self.occ_map.grid_map.shape[0] and
+                        self.occ_map.grid_map[my, mx] == DEPTH_OBSTACLE):
+                    self.occ_map.grid_map[my, mx] = FREESPACE
+            cells.clear()
+        self._floating_votes = {}
+        self._floating_confirmed = set()
+        self._floating_clear_votes = {}
+        self._floating_group = {}
+        self._floating_group_members = {}
         self.occ_map.floating_points = []
-        return
+        self.occ_map.build_cost_map()
+
+    def _signal_priority(self, sig):
+        if sig == 'green_carpet':
+            return 2
+        if isinstance(sig, tuple) and len(sig) >= 2 and sig[0] == 'column':
+            return 1
+        return 0
+
+    def _signal_key(self, sig):
+        if isinstance(sig, tuple) and len(sig) >= 2:
+            return (sig[0], sig[1])
+        return sig
+
+    def _signal_cooldown(self, sig):
+        if sig == 'green_carpet':
+            return CAMERA_GREEN_SIGNAL_COOLDOWN
+        if isinstance(sig, tuple) and len(sig) >= 2 and sig[0] == 'column':
+            return CAMERA_COLUMN_SIGNAL_COOLDOWN
+        return 0.0
+
+    def _signal_recently_active(self, sig, now=None):
+        now = time.time() if now is None else now
+        key = self._signal_key(sig)
+        cooldown = self._signal_cooldown(sig)
+        last_emit = self._last_detection_emit.get(key, -float('inf'))
+        last_handled = self._last_detection_handled.get(key, -float('inf'))
+        return (now - max(last_emit, last_handled)) < cooldown
+
+    def _mark_detection_handled(self, sig):
+        if sig is not None:
+            self._last_detection_handled[self._signal_key(sig)] = time.time()
+
+    def _push_detection_signal(self, sig):
+        if sig is None:
+            return
+        now = time.time()
+        if self._signal_recently_active(sig, now=now):
+            return
+        q = self.camera_detection_queue
+        if sig == 'green_carpet':
+            q = deque([s for s in q if not (isinstance(s, tuple) and s[0] == 'column')],
+                      maxlen=q.maxlen)
+            self.camera_detection_queue = q
+        if sig not in q:
+            q.append(sig)
+            self._last_detection_emit[self._signal_key(sig)] = now
+        self.camera_detection_signal = max(q, key=self._signal_priority) if q else None
+
+    def _pop_detection_signal(self):
+        q = self.camera_detection_queue
+        if q:
+            best_idx = max(range(len(q)), key=lambda i: self._signal_priority(q[i]))
+            sig = q[best_idx]
+            del q[best_idx]
+            self.camera_detection_signal = max(q, key=self._signal_priority) if q else None
+            self._mark_detection_handled(sig)
+            return sig
+        sig = self.camera_detection_signal
+        self.camera_detection_signal = None
+        self._mark_detection_handled(sig)
+        return sig
+
+
+    def _pop_scan_detection_signal(self):
+        q = self.camera_detection_queue
+        if q:
+            for predicate in (
+                    lambda s: isinstance(s, tuple) and len(s) >= 2 and s[0] == 'column',
+                    lambda s: s == 'green_carpet'):
+                for i, sig in enumerate(q):
+                    if predicate(sig):
+                        del q[i]
+                        self.camera_detection_signal = max(q, key=self._signal_priority) if q else None
+                        self._mark_detection_handled(sig)
+                        return sig
+        sig = self.camera_detection_signal
+        self.camera_detection_signal = None
+        self._mark_detection_handled(sig)
+        return sig
 
     # ── Camera helpers ────────────────────────────────────────────────────────
 
-    def get_hsv_image(self):
+    def get_hsv_image(self, scale=1.0):
         if self.camera_rgb is None:
             return None
         try:
@@ -469,6 +946,10 @@ class MyRobot(Robot):
             w = self.camera_rgb.getWidth()
             h = self.camera_rgb.getHeight()
             img = np.frombuffer(raw, np.uint8).reshape((h, w, 4))
+            if scale != 1.0:
+                img = cv2.resize(img, (max(1, int(w * scale)),
+                                       max(1, int(h * scale))),
+                                 interpolation=cv2.INTER_AREA)
             bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
             return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         except Exception:
@@ -499,48 +980,32 @@ class MyRobot(Robot):
 
     # ── Colour detection ──────────────────────────────────────────────────────
 
-    def there_is_red_wall(self):
-        hsv = self.get_hsv_image()
+    def detect_green(self, hsv=None, min_pixels=50):
+        # Accept a pre-fetched full-frame HSV image so the camera loop can share a
+        # single getImage()/cvtColor with detect_column instead of fetching twice.
         if hsv is None:
-            return False
-        h, w, _ = hsv.shape
-        m1 = cv2.inRange(hsv, np.array(RED_WALL_HSV_LOWER1), np.array(RED_WALL_HSV_UPPER1))
-        m2 = cv2.inRange(hsv, np.array(RED_WALL_HSV_LOWER2), np.array(RED_WALL_HSV_UPPER2))
-        return cv2.countNonZero(cv2.bitwise_or(m1, m2)) > w * h * COLOR_DETECTION_RED_PIXEL_RATIO
-
-    def detect_green(self):
-        hsv = self.get_bottom_half_hsv()
+            hsv = self.get_bottom_half_hsv()
+        else:
+            hsv = hsv[hsv.shape[0] // 2:, :]
         if hsv is None:
             return None
-        return cv2.countNonZero(utils.extract_color_mask(hsv, 'green')) > 50
+        return cv2.countNonZero(utils.extract_color_mask(hsv, 'green')) > min_pixels
 
-    def detect_column(self):
-        hsv = self.get_hsv_image()
+    def detect_column(self, hsv=None, min_pixels=20):
+        if hsv is None:
+            hsv = self.get_hsv_image()
         if hsv is None:
             return None
-        if cv2.countNonZero(utils.extract_color_mask(hsv, 'yellow')):
+        if cv2.countNonZero(utils.extract_color_mask(hsv, 'yellow')) >= min_pixels:
             return 'yellow'
-        if cv2.countNonZero(utils.extract_color_mask(hsv, 'blue')):
+        if cv2.countNonZero(utils.extract_color_mask(hsv, 'blue')) >= min_pixels:
             return 'blue'
         return None
 
-    def detect_column_strict(self, min_pixels=800):
-        hsv = self.get_hsv_image()
-        if hsv is None:
-            return None
-        roi = hsv[hsv.shape[0] // 2:, :]
-        if cv2.countNonZero(utils.extract_color_mask(roi, 'yellow')) > min_pixels:
-            return 'yellow'
-        if cv2.countNonZero(utils.extract_color_mask(roi, 'blue')) > min_pixels:
-            return 'blue'
-        return None
 
     def found_all_2_columns(self):
         return self.start_point is not None and self.end_point is not None
 
-    def column_close(self, column_mask):
-        return (np.count_nonzero(column_mask) /
-                (column_mask.shape[0] * column_mask.shape[1])) > 0.25
 
     def get_column_center_ratio(self, color):
         hsv = self.get_hsv_image()
@@ -564,7 +1029,6 @@ class MyRobot(Robot):
         return cv2.countNonZero(utils.extract_color_mask(hsv, color)[:top_strip, :]) == 0
 
     def estimate_column_distance(self, color):
-        self.stop_motor()
         depth_img = self.get_camera_depth_cm()
         hsv_img   = self.get_hsv_image()
         if depth_img is None or hsv_img is None:
@@ -585,169 +1049,157 @@ class MyRobot(Robot):
             return float(np.mean(valid_depths))
         return float(np.sqrt(max_d ** 2 - col_h ** 2)) + 10.0
 
-    def _depth_obstacle_points_local(self, pixel_stride=3, max_depth=5.0,
-                                     require_ground_support=True):
+    def _get_depth_frame(self):
+        """Fetch the raw depth image plus its pinhole intrinsics once, shared
+        by both point extraction and frustum-gated clearing so a frame is
+        only ever read from the device a single time per refresh."""
         if self.camera_depth is None:
-            return np.empty((0, 3), dtype=np.float32)
+            return None
         try:
             depth_data = self.camera_depth.getRangeImage()
             if not depth_data:
-                return np.empty((0, 3), dtype=np.float32)
-        except Exception:
-            return np.empty((0, 3), dtype=np.float32)
-        try:
+                return None
             w   = self.camera_depth.getWidth()
             h   = self.camera_depth.getHeight()
             fov = self.camera_depth.getFov()
         except Exception:
-            return np.empty((0, 3), dtype=np.float32)
+            return None
         fx = w / (2.0 * np.tan(fov / 2.0))
         fy = fx
         cx = w / 2.0
         cy = h / 2.0
-
         depth_arr = np.array(depth_data, dtype=np.float32).reshape(h, w)
+        return depth_arr, fx, fy, cx, cy, w, h
+
+    def _calibrate_camera_height(self):
+        """One-shot empirical refinement of camera_height_m (Nav2/STVL-style
+        height-band marking is only as good as this one number). The proto
+        chain gives a starting estimate, but the true optical-center height
+        above the floor also depends on manufacturing tolerance and mount
+        slop that the proto alone can't capture. Point-blank floor pixels in
+        the near, central bottom strip of the depth image should compute to
+        height == 0 by construction (camera_height_m - d*y_n == 0), so
+        solving that equation for camera_height_m over real floor pixels
+        calibrates out whatever residual bias remains. Runs once, only
+        while the patch looks like flat open floor (tight variance); tries
+        again on later frames otherwise, and simply keeps the proto-derived
+        default forever if a clean floor patch never appears.
+        """
+        frame = self._get_depth_frame()
+        if frame is None:
+            return
+        depth_arr, fx, fy, cx, cy, w, h = frame
+        row_lo = int(h * 0.85)
+        col_lo, col_hi = int(w * 0.35), int(w * 0.65)
+        patch = depth_arr[row_lo:h, col_lo:col_hi]
+        valid = np.isfinite(patch) & (patch > 0.05) & (patch < 2.0)
+        if np.count_nonzero(valid) < 20:
+            return
+        vv, uu = np.where(valid)
+        d = patch[vv, uu]
+        y_n = ((vv + row_lo).astype(np.float32) - cy) / fy
+        implied_height_if_zero_bias = d * y_n
+        if float(np.std(implied_height_if_zero_bias)) > 0.03:
+            return  # not flat/consistent enough to trust as open floor
+        estimate = float(np.median(implied_height_if_zero_bias))
+        if not (0.10 < estimate < 0.30):
+            return  # implausible relative to the proto-derived starting point
+        self.camera_height_m = estimate
+        self._camera_height_calibrated = True
+
+    def _depth_obstacle_points_local(self, pixel_stride=3, max_depth=3.5):
+        """Height-band point extraction (Nav2 ObstacleLayer / STVL style):
+        every 3D point whose height falls inside
+        [GROUND_EPSILON_M, ROBOT_CLEARANCE_HEIGHT_M] is a collision hazard,
+        full stop — no distinction between "floating" and "grounded" is
+        computed or needed. A point below the band is the floor; a point
+        above it is something the robot fits under (an overhang the LiDAR
+        being blind to is irrelevant, since it doesn't block anything); a
+        point already in the band blocks the robot whether the surface it
+        belongs to touches the ground somewhere else or not. LiDAR-visible
+        walls fall in this band too and get marked redundantly, which is
+        harmless (map.py already lets a LiDAR OBSTACLE win over
+        DEPTH_OBSTACLE), and dropping the previous per-pixel downward
+        "ground support" column scan removes both an O(candidates ×
+        image-height) pure-Python loop and the exact failure mode it
+        caused: a genuinely floating wall whose underside numerically
+        looked "connected" to nearby floor within noise tolerance was
+        silently discarded as a false positive.
+        """
+        frame = self._get_depth_frame()
+        if frame is None:
+            return np.empty((0, 3), dtype=np.float32)
+        depth_arr, fx, fy, cx, cy, w, h = frame
         valid = np.isfinite(depth_arr) & (depth_arr > 0.05) & (depth_arr < max_depth)
-        # diagnostics: record counts so we can inspect why detection fails
-        try:
-            self._last_depth_diag = {
-                'valid_pixels': int(np.count_nonzero(valid)),
-                'h': int(h), 'w': int(w), 'pixel_stride': int(pixel_stride)
-            }
-        except Exception:
-            pass
         if not np.any(valid):
             return np.empty((0, 3), dtype=np.float32)
 
         rows = np.arange(0, h, pixel_stride)
         cols = np.arange(0, w, pixel_stride)
         vv, uu = np.meshgrid(rows, cols, indexing='ij')
-        d = depth_arr[vv, uu]
+        d  = depth_arr[vv, uu]
         ok = valid[vv, uu]
-        try:
-            if hasattr(self, '_last_depth_diag'):
-                self._last_depth_diag['sampled_candidates'] = int(np.count_nonzero(ok))
-        except Exception:
-            pass
+        if not np.any(ok):
+            return np.empty((0, 3), dtype=np.float32)
+
+        # Reject silhouette "flying pixel" artifacts: a genuine surface
+        # point has depth close to its immediate neighbours; a pixel that
+        # straddles an object's edge against a much farther background does
+        # not. Vectorized against the full-resolution neighbours, not the
+        # strided sample, so it catches the true local discontinuity. The
+        # threshold scales with the pixel's own depth (floored at
+        # DEPTH_EDGE_DISCONTINUITY_M) so a wall seen nearly edge-on — whose
+        # real, non-artifact depth gradient across neighbouring pixels
+        # grows with distance from ordinary perspective — isn't mistaken
+        # for a silhouette jump and dropped wholesale.
+        # d itself, and either neighbour, can be inf/NaN here (a "no return"
+        # pixel — e.g. open space beyond max range) since `ok` from `valid`
+        # hasn't been applied yet. inf-inf / NaN arithmetic below is
+        # harmless (any comparison against NaN is already False, so it
+        # can't wrongly ADMIT a bad point) but does emit spurious
+        # RuntimeWarnings, and — more importantly — treating a genuinely
+        # MISSING neighbour reading as automatic proof of a "silhouette
+        # jump" was wrong: a wall seen nearly edge-on (a "vertical" wall
+        # the robot mostly passes alongside) often has open space or
+        # out-of-range background immediately next to its face in the
+        # image, which is exactly a missing/invalid neighbour, not
+        # evidence of a flying-pixel artifact — so it was being rejected
+        # for the wrong reason. A missing neighbour now contributes no
+        # evidence either way; only an actually-measured, too-different
+        # neighbour rejects a point.
+        d_right = depth_arr[vv, np.minimum(uu + 1, w - 1)]
+        d_down  = depth_arr[np.minimum(vv + 1, h - 1), uu]
+        finite_d = np.isfinite(d)
+        right_finite = np.isfinite(d_right)
+        down_finite  = np.isfinite(d_down)
+        with np.errstate(invalid='ignore'):
+            diff_right = np.abs(d - d_right)
+            diff_down  = np.abs(d - d_down)
+            edge_thresh = np.maximum(DEPTH_EDGE_DISCONTINUITY_M,
+                                      DEPTH_EDGE_RELATIVE_FRACTION * np.where(finite_d, d, 0.0))
+        right_ok = ~right_finite | (diff_right < edge_thresh)
+        down_ok  = ~down_finite  | (diff_down  < edge_thresh)
+        edge_ok = finite_d & right_ok & down_ok
+        ok &= edge_ok
         if not np.any(ok):
             return np.empty((0, 3), dtype=np.float32)
 
         uu = uu[ok].astype(np.int32)
         vv = vv[ok].astype(np.int32)
         d  = d[ok].astype(np.float32)
-        uu_f = uu.astype(np.float32)
-        vv_f = vv.astype(np.float32)
-        x_n = (uu_f - cx) / fx
-        y_n = (vv_f - cy) / fy
+        x_n = (uu.astype(np.float32) - cx) / fx
+        y_n = (vv.astype(np.float32) - cy) / fy
 
         forward = d + self.X_offset
         lateral = -d * x_n + self.Y_offset
         height  = self.camera_height_m - d * y_n
-        obstacle_height = ((height >= DEPTH_OBSTACLE_MIN_HEIGHT) &
-                           (height <= DEPTH_OBSTACLE_MAX_HEIGHT))
-        if not np.any(obstacle_height):
+
+        band = (height >= GROUND_EPSILON_M) & (height <= ROBOT_CLEARANCE_HEIGHT_M)
+        if not np.any(band):
             return np.empty((0, 3), dtype=np.float32)
-
-        if require_ground_support:
-            floating_collision_height = (
-                (height >= DEPTH_OBSTACLE_FLOATING_MIN_HEIGHT) &
-                (height <= DEPTH_OBSTACLE_FLOATING_MAX_HEIGHT)
-            )
-            if not np.any(floating_collision_height):
-                return np.empty((0, 3), dtype=np.float32)
-
-            # Pre-compute minimum valid depth per column to detect back-wall points.
-            # A point whose depth exceeds the column minimum by >0.20 m is behind a
-            # closer obstacle (the floating wall itself) and must not be treated as
-            # a floating wall candidate.
-            valid_depth_full = np.where(
-                np.isfinite(depth_arr) & (depth_arr > 0.05) & (depth_arr < max_depth),
-                depth_arr, np.inf
-            )
-            min_depth_per_col = np.min(valid_depth_full, axis=0)
-
-            support_ok = np.zeros(len(height), dtype=bool)
-            for i in np.where(floating_collision_height)[0]:
-                u_col = int(uu[i])
-                v_row = int(vv[i])
-                d_ref = float(d[i])
-                # Skip: this point is behind a closer obstacle in the same column.
-                if d_ref - min_depth_per_col[u_col] > 0.20:
-                    support_ok[i] = True  # treat as supported so it is excluded
-                    continue
-                for sv in range(v_row + 1, h):
-                    sd = depth_arr[sv, u_col]
-                    if not (np.isfinite(sd) and 0.05 < sd < max_depth):
-                        break  # surface ended → floating
-                    if abs(sd - d_ref) > 0.15:
-                        break  # different surface below → floating
-                    y_n2 = (float(sv) - cy) / fy
-                    h2 = self.camera_height_m - sd * y_n2
-                    if h2 <= DEPTH_OBSTACLE_SUPPORT_MAX_HEIGHT:
-                        support_ok[i] = True
-                        break
-
-            floating_mask = floating_collision_height & ~support_ok
-            if not np.any(floating_mask):
-                return np.empty((0, 3), dtype=np.float32)
-            return np.stack(
-                [forward[floating_mask],
-                 lateral[floating_mask],
-                 height[floating_mask]],
-                axis=1
-            ).astype(np.float32)
-
         return np.stack(
-            [forward[obstacle_height],
-             lateral[obstacle_height],
-             height[obstacle_height]],
-            axis=1
+            [forward[band], lateral[band], height[band]], axis=1
         ).astype(np.float32)
-
-    def _floating_wall_is_passable(self, pts):
-        """Ignore depth walls that sit above the robot's usable clearance.
-
-        These are visible in depth, but the robot can drive underneath them, so
-        they should not be stamped into the occupancy grid as blocking cells.
-        """
-        if pts is None or len(pts) == 0:
-            return True
-        usable_clearance = self.camera_height_m + 0.02
-        return float(np.min(pts[:, 2])) > usable_clearance
-
-    def _rasterize_floating_wall_cells(self, cells, orientation=None):
-        if not cells:
-            return set()
-        pts = np.array(list(cells), dtype=np.int32)
-        if pts.shape[0] == 1:
-            return {(int(pts[0, 0]), int(pts[0, 1]))}
-
-        if orientation == 'vertical':
-            order = np.lexsort((pts[:, 0], pts[:, 1]))
-        else:
-            # Default to the robot-forward axis so slightly noisy point clouds
-            # collapse into one continuous wall trace instead of scattered dots.
-            order = np.lexsort((pts[:, 1], pts[:, 0]))
-        pts = pts[order]
-
-        raster = set()
-        for p0, p1 in zip(pts[:-1], pts[1:]):
-            for x, y in utils.ray_cells((int(p0[0]), int(p0[1])),
-                                        (int(p1[0]), int(p1[1]))):
-                raster.add((x, y))
-
-        # Thicken the trace a little so the wall reads as a wall in the map.
-        radius = max(0, int(DEPTH_OBSTACLE_STAMP_RADIUS))
-        if radius == 0:
-            return raster
-        expanded = set()
-        for x, y in raster:
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    if dx * dx + dy * dy > radius * radius:
-                        continue
-                    expanded.add((x + dx, y + dy))
-        return expanded
 
     def _column_depth_position_local(self, color):
         if self.camera_depth is None:
@@ -782,49 +1234,25 @@ class MyRobot(Robot):
         d = d[keep]
 
         fx = w / (2.0 * np.tan(fov / 2.0))
-        fy = fx
         cx = w / 2.0
         cy = h / 2.0
         u = float(np.median(uu))
         v = float(np.median(vv))
         depth_m = float(np.median(d))
         x_n = (u - cx) / fx
-        y_n = (v - cy) / fy
+        y_n = (v - cy) / fx
         forward = depth_m + self.X_offset
         lateral = -depth_m * x_n + self.Y_offset
         height = self.camera_height_m - depth_m * y_n
         return np.array([forward, lateral, height], dtype=np.float32)
 
-    def _classify_floating_wall(self, pts):
-        """Classify a set of floating-wall points as 'horizontal' (front-back, parallel)
-        or 'vertical' (left-right, perpendicular) relative to the robot frame.
-        Returns 'horizontal', 'vertical' or None if ambiguous.
-        """
-        try:
-            if pts is None or len(pts) < 3:
-                return None
-            xy = pts[:, :2].astype(np.float64)  # forward, lateral
-            mean = xy.mean(axis=0)
-            X = xy - mean
-            cov = X.T @ X
-            w, v = np.linalg.eigh(cov)
-            principal = v[:, np.argmax(w)]
-            angle = math.atan2(principal[1], principal[0])  # radians
-            # Normalize to [0, pi/2]
-            ang = abs(angle)
-            if ang > math.pi/2:
-                ang = abs(ang - math.pi)
-            # User-defined: horizontal = front-back (parallel to robot heading)
-            if abs(ang - 0.0) < 0.35:
-                return 'horizontal'
-            if abs(ang - (math.pi / 2.0)) < 0.35:
-                return 'vertical'
-            return None
-        except Exception:
-            return None
-
     def _depth_wall_blocks_column(self, column_local):
-        wall_pts = self._depth_obstacle_points_local(pixel_stride=2, max_depth=5.0)
+        """True if an obstacle sits directly between the robot and the
+        column's reported position (i.e. the "column" sighting is actually
+        a wall/panel in front of it). `_depth_obstacle_points_local` already
+        restricts its output to the robot-blocking height band, so no
+        further height test is needed here."""
+        wall_pts = self._depth_obstacle_points_local(pixel_stride=2, max_depth=3.5)
         if wall_pts.shape[0] == 0:
             return False
         forward, lateral, _ = column_local
@@ -834,19 +1262,11 @@ class MyRobot(Robot):
         wall_bearing = wall_pts[:, 1] / np.maximum(wall_pts[:, 0], 1e-6)
         same_bearing = np.abs(wall_bearing - bearing) < 0.10
         before_column = wall_pts[:, 0] < forward - 0.08
-        blocking_height = (
-            (wall_pts[:, 2] >= DEPTH_OBSTACLE_FLOATING_MIN_HEIGHT) &
-            (wall_pts[:, 2] <= DEPTH_OBSTACLE_FLOATING_MAX_HEIGHT) &
-            (wall_pts[:, 2] <= self.camera_height_m + 0.02)
-        )
-        mask = same_bearing & before_column & blocking_height
-        if not np.any(mask):
-            self.last_floating_wall_orientation = None
-            return False
-        # Classify orientation from the subset of blocking points and store it
-        orientation = self._classify_floating_wall(wall_pts[mask])
-        self.last_floating_wall_orientation = orientation
-        return True
+        mask = same_bearing & before_column
+        return bool(np.any(mask))
+
+    def _column_is_front_facing(self, color):
+        return self.get_column_center_ratio(color) >= 0.20
 
     # ── Obstacle detection ────────────────────────────────────────────────────
 
@@ -859,8 +1279,17 @@ class MyRobot(Robot):
     def there_is_obstacle(self, map_target):
         return self.occ_map.cell_blocked(map_target)
 
-    def robot_stuck(self, last_pos, stuck_distance=0.16):
-        return np.linalg.norm(self.get_position() - last_pos) < stuck_distance
+
+    def _unknown_neighborhood_score(self, mx, my, radius=5):
+        grid = self.grid_map
+        h, w = grid.shape
+        mx, my = int(mx), int(my)
+        if not (0 <= mx < w and 0 <= my < h):
+            return 0.0
+        x0, x1 = max(0, mx - radius), min(w, mx + radius + 1)
+        y0, y1 = max(0, my - radius), min(h, my + radius + 1)
+        area = max(1, (x1 - x0) * (y1 - y0))
+        return float(np.count_nonzero(grid[y0:y1, x0:x1] == UNKNOWN)) / float(area)
 
     # ── DWA planner ───────────────────────────────────────────────────────────
 
@@ -875,6 +1304,7 @@ class MyRobot(Robot):
             for w in DWA_ANGULAR_SAMPLES:
                 cx, cy, ct = x, y, theta
                 ok = True
+                unknown_bonus = 0.0
                 for _ in range(5):           # 5-step horizon → ~160 ms look-ahead
                     cx += v * np.cos(ct) * dt
                     cy += v * np.sin(ct) * dt
@@ -883,6 +1313,16 @@ class MyRobot(Robot):
                     if self.there_is_obstacle([pmx, pmy]):
                         ok = False
                         break
+                    if (self.occ_map.cost_map is not None and
+                            0 <= pmx < MAP_SIZE and 0 <= pmy < MAP_SIZE and
+                            float(self.occ_map.cost_map[pmy, pmx]) > 0.92):
+                        ok = False
+                        break
+                    if not self.found_all_2_columns():
+                        unknown_bonus = max(
+                            unknown_bonus,
+                            self._unknown_neighborhood_score(pmx, pmy, radius=4)
+                        )
                 if not ok:
                     continue
                 pd   = np.linalg.norm(world_target - np.array([cx, cy]))
@@ -896,7 +1336,9 @@ class MyRobot(Robot):
                 score = (DWA_HEADING_WEIGHT  * np.cos(herr) +
                          DWA_DISTANCE_WEIGHT * (1.0 - pd / max(0.1, cur_dist * 2)) +
                          DWA_SPEED_WEIGHT    * v / max(DWA_VELOCITY_SAMPLES) -
-                         DWA_COST_MAP_WEIGHT * cost_penalty)
+                         DWA_COST_MAP_WEIGHT * cost_penalty -
+                         0.18 * abs(w) +
+                         DWA_UNKNOWN_WEIGHT  * unknown_bonus)
                 if score > best_score:
                     best_score, best_v, best_w = score, v, w
 
@@ -910,32 +1352,58 @@ class MyRobot(Robot):
             self.follow_target_last_position = None
             self.follow_target_stuck_count   = 0
             self._phys_stuck_count           = 0
+            self._scan_stuck_count           = 0
+            self._last_scan_fp               = None
+            self._waypoint_motion_commanded  = False
+            self.stop_motor()
             return True, False
 
         cur = self.get_position()
+        scan_fp = self._get_scan_fp()
         if self.follow_target_last_position is not None:
             moved = np.linalg.norm(cur - self.follow_target_last_position)
             if moved < self.follow_target_position_threshold:
                 self.follow_target_stuck_count += 1
                 if self.follow_target_stuck_count >= self.follow_target_stuck_threshold:
+                    self.stop_motor()
                     self.follow_target_stuck_count   = 0
                     self.follow_target_last_position = None
                     self._phys_stuck_count           = 0
+                    self._scan_stuck_count           = 0
+                    self._waypoint_motion_commanded  = False
                     return False, True
             else:
                 self.follow_target_stuck_count = 0
         self.follow_target_last_position = cur
+
+        if self._waypoint_motion_commanded:
+            scan_delta = self._scan_delta(scan_fp, self._last_scan_fp)
+            if scan_delta is not None and scan_delta < 0.006:
+                self._scan_stuck_count += 1
+                if self._scan_stuck_count >= 10:
+                    self.stop_motor()
+                    self._scan_stuck_count           = 0
+                    self.follow_target_last_position = None
+                    self.follow_target_stuck_count   = 0
+                    self._last_scan_fp               = scan_fp
+                    self._waypoint_motion_commanded  = False
+                    return False, True
+            else:
+                self._scan_stuck_count = 0
+        self._last_scan_fp = scan_fp
 
         # Obstacle stop: cut motors the instant a wall is detected so the
         # wheel encoders stop counting.  This is the core drift fix — no wheel
         # spin means no encoder accumulation and no phantom map movement.
         if self.obstacle_in_front():
             self.stop_motor()                  # encoders freeze immediately
+            self._waypoint_motion_commanded = False
             self._phys_stuck_count += 1
             if self._phys_stuck_count >= 4:    # 4 × 32 ms = 128 ms of solid contact
                 self._phys_stuck_count           = 0
                 self.follow_target_last_position = None
                 self.follow_target_stuck_count   = 0
+                self._scan_stuck_count           = 0
                 return False, True
             return False, False                # motors off, wait one more step
         self._phys_stuck_count = 0
@@ -951,37 +1419,32 @@ class MyRobot(Robot):
             self.follow_target_stuck_count = 0   # rotation is intentional, not stuck
             w_rot = 2.0 if herr > 0 else -2.0
             lsp, rsp = self.velocity_to_wheel_speeds(0.0, w_rot)
-            self.set_robot_velocity(lsp, rsp)
+            self._set_path_velocity(lsp, rsp, alpha=0.7)
+            self._waypoint_motion_commanded = True
             return False, False
 
         v, w   = self.dwa_planner(np.array([wx, wy]))
+        if v <= 0.001 and abs(w) <= 0.001:
+            self.stop_motor()
+            self._dwa_no_motion_count += 1
+            if self._dwa_no_motion_count >= 3:
+                self._dwa_no_motion_count = 0
+                self.follow_target_last_position = None
+                self._waypoint_motion_commanded = False
+                return False, True
+            return False, False
+        self._dwa_no_motion_count = 0
+        if v < 0.08 and abs(w) < 0.25:
+            v = 0.08
         ls, rs = self.velocity_to_wheel_speeds(v, w)
-        self.set_robot_velocity(ls, rs)
+        self._set_path_velocity(ls, rs)
+        self._waypoint_motion_commanded = abs(ls) > 0.2 or abs(rs) > 0.2
         return False, False
 
     # ── Recovery / direction adaptation ──────────────────────────────────────
 
-    def avoid_obstacle(self):
-        ds = self.get_distances()
-        if len(ds) >= 4 and np.mean(ds) < 0.3:
-            self.move_backward_milisecond(50)
-            return
-        attempts = 0
-        while (len(ds) >= 3 and
-               min(ds[0], ds[2]) < OBSTACLE_AVOID_THRESHOLD and
-               attempts < OBSTACLE_AVOID_MAX_ATTEMPTS):
-            ms = random.randint(TURN_DURATION_MIN, TURN_DURATION_MAX)
-            if ds[0] < ds[2]:
-                self.turn_right_milisecond(ms)
-            else:
-                self.turn_left_milisecond(ms)
-            attempts += 1
-            ds = self.get_distances()
 
     def unstick(self, turn_range=(400, 600)):
-        self.set_robot_velocity(MOTOR_VELOCITY_BACKWARD, MOTOR_VELOCITY_BACKWARD)
-        d = self.get_distances()
-        self.step(500 if (len(d) >= 4 and d[1] > 0.25 and d[3] > 0.25) else 250)
         self.stop_motor()
         for _ in range(40):
             if self.step(self.time_step) == -1:
@@ -999,9 +1462,6 @@ class MyRobot(Robot):
                 return
 
     def clear_obstacle(self, turn_range=(400, 600)):
-        self.set_robot_velocity(MOTOR_VELOCITY_BACKWARD, MOTOR_VELOCITY_BACKWARD)
-        d = self.get_distances()
-        self.step(500 if (len(d) >= 4 and d[2] > 0.25 and d[3] > 0.25) else 250)
         self.stop_motor()
         for _ in range(30):
             if self.step(self.time_step) == -1:
@@ -1030,6 +1490,18 @@ class MyRobot(Robot):
                 self.occ_map.robot_position = (mx, my)
             self.occ_map.refresh_viz()
             return
+        column_cells = set()
+        for p in (self.start_point, self.end_point):
+            if p is not None:
+                column_cells.add((int(round(float(p[0]))), int(round(float(p[1])))))
+        for p in (self.occ_map.column_points or []):
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                column_cells.add((int(round(float(p[0]))), int(round(float(p[1])))))
+
+        def near_column_cell(x, y, radius=3):
+            return any((x - cx) * (x - cx) + (y - cy) * (y - cy) <= radius * radius
+                       for cx, cy in column_cells)
+
         half = self.occ_map.map_size // 2
         for r in range(1, 30):
             for dy in range(-r, r + 1):
@@ -1038,7 +1510,8 @@ class MyRobot(Robot):
                         continue  # walk only the ring perimeter
                     nx, ny = mx + dx, my + dy
                     if 0 <= nx < W and 0 <= ny < H:
-                        if self.occ_map.grid_map[ny, nx] == FREESPACE:
+                        if (self.occ_map.grid_map[ny, nx] == FREESPACE and
+                                not near_column_cell(nx, ny)):
                             self._odom_x = (nx - half) * RESOLUTION
                             self._odom_y = (half - ny) * RESOLUTION
                             print(f'[Recovery] Odometry snapped map ({mx},{my})'
@@ -1050,36 +1523,6 @@ class MyRobot(Robot):
         print('[Recovery] Could not find a free cell to snap to — position unchanged')
 
     # ── Alignment helpers ─────────────────────────────────────────────────────
-
-    def align_to_red_wall(self):
-        Kp, Kd    = ALIGN_RED_WALL_KP, ALIGN_RED_WALL_KD
-        last_err  = 0
-        count     = 0
-        while self.step(self.time_step) != -1:
-            count += 1
-            if count > 100:
-                self.stop_motor()
-                break
-            hsv = self.get_hsv_image()
-            if hsv is None:
-                self.stop_motor()
-                break
-            h, w, _ = hsv.shape
-            is_mid, red_mask = utils.red_wall_centered(hsv)
-            M = cv2.moments(red_mask)
-            if M['m00'] > 0:
-                cx    = int(M['m10'] / M['m00'])
-                err   = cx - (w // 2)
-                if abs(err) < ALIGN_RED_WALL_ERROR_THRESHOLD and is_mid:
-                    self.stop_motor()
-                    break
-                spd = RED_WALL_ALIGNMENT_SPEED / self.wheel_radius
-                self.set_robot_velocity(spd + Kp * err + Kd * (err - last_err),
-                                        spd - Kp * err - Kd * (err - last_err))
-                last_err = err
-            else:
-                self.stop_motor()
-                break
 
     def center_column_in_view(self, color):
         Kp, Kd    = ALIGN_COLUMN_KP, ALIGN_COLUMN_KD
@@ -1110,34 +1553,8 @@ class MyRobot(Robot):
                 self.stop_motor()
                 break
 
-    def align_to_column(self, color):
-        Kp, Kd = ALIGN_COLUMN_KP, ALIGN_COLUMN_KD
-        last_err = 0
-        fwd = ALIGN_COLUMN_FORWARD_SPEED / self.wheel_radius
-        while self.step(self.time_step) != -1:
-            hsv = self.get_hsv_image()
-            if hsv is None:
-                self.stop_motor()
-                break
-            h, w, _ = hsv.shape
-            mask = utils.extract_color_mask(hsv, color)
-            M    = cv2.moments(mask)
-            if M['m00'] > 0:
-                cx  = int(M['m10'] / M['m00'])
-                err = cx - (w // 2)
-                if abs(err) < ALIGN_COLUMN_ERROR_THRESHOLD or np.sum(mask) / (h * w) > 0.7:
-                    self.stop_motor()
-                    break
-                turn = Kp * err + Kd * (err - last_err)
-                self.set_robot_velocity(fwd + turn, fwd - turn)
-                last_err = err
-                self.step(self.time_step)
-            else:
-                self.stop_motor()
-                break
 
-    def align_to_path(self, map_target, angle_threshold_deg=15,
-                      clear_distance=0.6, back_distance=0.18):
+    def align_to_path(self, map_target, angle_threshold_deg=15):
         if map_target is None:
             return True
         try:
@@ -1151,16 +1568,6 @@ class MyRobot(Robot):
         while angle < -np.pi: angle += 2 * np.pi
         if abs(np.degrees(angle)) < angle_threshold_deg:
             return True
-        if self.get_min_front_distance() <= clear_distance and back_distance > 0:
-            back_speed = 0.12
-            dt    = TIME_STEP / 1000.0
-            steps = max(1, int(back_distance / (back_speed * dt)))
-            lw, rw = self.velocity_to_wheel_speeds(-back_speed, 0.0)
-            self.set_robot_velocity(lw, rw)
-            for _ in range(steps):
-                if self.step(self.time_step) == -1:
-                    break
-            self.stop_motor()
         w_cmd = 1.0 if angle > 0 else -1.0
         lsp, rsp = self.velocity_to_wheel_speeds(0.0, w_cmd)
         self.set_robot_velocity(lsp, rsp)
@@ -1180,41 +1587,93 @@ class MyRobot(Robot):
     def mark_column(self, color):
         est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
         if est is not None:
+            if not self._column_commit_ready(color):
+                return False
             mp = (int(round(float(est[0]))), int(round(float(est[1]))))
         else:
             column_local = self._column_depth_position_local(color)
-            if column_local is None or self._depth_wall_blocks_column(column_local):
-                return
+            if column_local is None:
+                return False
+            if not self._column_is_front_facing(color) and self._depth_wall_blocks_column(column_local):
+                return False
+            if column_local[0] * 100.0 > COLUMN_COMMIT_MAX_DISTANCE_CM:
+                return False
             heading = self.get_heading('rad')
             R = np.array([[np.cos(heading), -np.sin(heading)],
                           [np.sin(heading),  np.cos(heading)]])
             wp = column_local[:2] @ R.T + np.array([self._odom_x, self._odom_y])
             mp = self.convert_to_map_coordinates(float(wp[0]), float(wp[1]))
-        self._commit_column_cell(color, mp)
-        if color == 'blue':
-            self.start_point = mp
-        elif color == 'yellow':
-            self.end_point = mp
-        self.last_found_color = color
-        self.last_found_point = mp
+        # Maze1 reference: commit the raw projected point. _refine_column_map_position
+        # snapped the marker into the pillar's own OBSTACLE blob, which broke plotting.
+        self._set_committed_column(color, mp)
+        return True
 
     def mark_on_map(self, distance_cm, color='blue'):
         column_local = self._column_depth_position_local(color)
-        if column_local is None or self._depth_wall_blocks_column(column_local):
-            return
+        if column_local is None:
+            return False
+        if not self._column_is_front_facing(color) and self._depth_wall_blocks_column(column_local):
+            return False
         if column_local[0] * 100.0 < COLOR_DETECTION_DEPTH_THRESHOLD:
             heading = self.get_heading('rad')
             R = np.array([[np.cos(heading), -np.sin(heading)],
                           [np.sin(heading),  np.cos(heading)]])
             wp = column_local[:2] @ R.T + np.array([self._odom_x, self._odom_y])
             mp = self.convert_to_map_coordinates(float(wp[0]), float(wp[1]))
-            if not self._column_line_of_sight_clear(mp):
-                return
-            self._commit_column_cell(color, mp)
-            if color == 'blue':
-                self.start_point = mp
-            elif color == 'yellow':
-                self.end_point = mp
+            # Maze1 reference: use the raw projected point (no _refine snap).
+            # Skip LOS check when front-facing: the pillar's own OBSTACLE cells
+            # would block the ray even though the camera has direct line of sight.
+            if not self._column_is_front_facing(color) and not self._column_line_of_sight_clear(mp):
+                return False
+            self._set_committed_column(color, mp)
+            return True
+        return False
+
+    def _set_committed_column(self, color, mp):
+        self._commit_column_cell(color, mp)
+        if color == 'blue':
+            self.start_point = mp
+        elif color == 'yellow':
+            self.end_point = mp
+        if self.first_found_color is None:
+            self.first_found_color = color
+        if self._column_focus_color == color:
+            self._column_focus_color = None
+            self._column_focus_target = None
+        self.last_found_color = color
+        self.last_found_point = mp
+
+    def _column_is_committed(self, color):
+        return self.start_point is not None if color == 'blue' else self.end_point is not None
+
+    def _column_commit_ready(self, color):
+        est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
+        if est is None:
+            return False
+        if self._column_close_front_visible(color):
+            return True
+        updates = self.blue_pos_update_count if color == 'blue' else self.yellow_pos_update_count
+        if updates < COLUMN_COMMIT_MIN_ESTIMATES:
+            return False
+        if self.get_map_distance(est) <= COLUMN_COMMIT_MAX_MAP_DISTANCE:
+            return True
+        dist = self.estimate_column_distance(color)
+        return dist is not None and dist <= COLUMN_COMMIT_MAX_DISTANCE_CM
+
+    def _column_close_front_visible(self, color):
+        dist = self.estimate_column_distance(color)
+        return (dist is not None and dist < COLOR_DETECTION_DEPTH_THRESHOLD and
+                self._column_is_front_facing(color))
+
+    def _commit_column_from_estimate(self, color, force=False):
+        if not force and not self._column_commit_ready(color):
+            return False
+        est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
+        if est is None:
+            return False
+        mp = (int(round(float(est[0]))), int(round(float(est[1]))))
+        self._set_committed_column(color, mp)
+        return True
 
     def update_column_estimation(self, color, position):
         if color == 'blue':
@@ -1240,9 +1699,47 @@ class MyRobot(Robot):
         h, w = grid.shape
         for rx, ry in ray[1:-end_margin]:
             if 0 <= rx < w and 0 <= ry < h:
-                if grid[ry, rx] in (OBSTACLE, DEPTH_OBSTACLE, CLOSED, GREEN_CARPET):
+                # DEPTH_OBSTACLE (floating walls) are at a different height than
+                # columns; if the RGB camera can see the column colour the visual
+                # LOS is clear, so only solid LiDAR walls block the ray here.
+                if grid[ry, rx] in (OBSTACLE, CLOSED, GREEN_CARPET):
                     return False
         return True
+
+
+    def _column_approach_target(self, pos, min_radius=6, max_radius=18):
+        if pos is None:
+            return None
+        grid = self.grid_map
+        h, w = grid.shape
+        cx, cy = int(round(float(pos[0]))), int(round(float(pos[1])))
+        robot = np.array(self.get_map_position(), dtype=float)
+        best, best_score = None, float('inf')
+        for radius in range(min_radius, max_radius + 1, 2):
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if abs(dx) != radius and abs(dy) != radius:
+                        continue
+                    x, y = cx + dx, cy + dy
+                    if not (0 <= x < w and 0 <= y < h):
+                        continue
+                    if grid[y, x] not in (FREESPACE, UNKNOWN):
+                        continue
+                    if self.occ_map.cell_blocked((x, y)):
+                        continue
+                    if not self._column_line_of_sight_clear((x, y), end_margin=1):
+                        continue
+                    unknown_score = self._unknown_neighborhood_score(x, y, radius=5)
+                    if unknown_score <= 0.0:
+                        continue
+                    score = float(np.linalg.norm(np.array([x, y], dtype=float) - robot))
+                    score += 0.25 * abs(math.hypot(dx, dy) - 10.0)
+                    score -= 18.0 * unknown_score
+                    if score < best_score:
+                        best_score, best = score, (x, y)
+            if best is not None:
+                return best
+        return None
 
     def _commit_column_cell(self, color, mp, radius=1):
         """Mark a small circular marker on the map for the detected column and
@@ -1278,20 +1775,31 @@ class MyRobot(Robot):
         if column_local is None:
             return False
         # If a floating wall blocks the column, record orientation and abort
-        if self._depth_wall_blocks_column(column_local):
+        if (not self._column_is_front_facing(color) and
+                self._depth_wall_blocks_column(column_local)):
             return False
         heading = self.get_heading('rad')
         R = np.array([[np.cos(heading), -np.sin(heading)],
                       [np.sin(heading),  np.cos(heading)]])
         wp = column_local[:2] @ R.T + np.array([self._odom_x, self._odom_y])
         mp = self.convert_to_map_coordinates(float(wp[0]), float(wp[1]))
-        if not self._column_line_of_sight_clear(mp):
+        # Plot the raw projected front-surface point (Maze1 reference behaviour).
+        # The previous _refine_column_map_position() snapped the marker into the
+        # pillar's own LiDAR OBSTACLE blob, which then failed the line-of-sight
+        # check against itself — that is why a pillar directly in front never got
+        # plotted. Keep the front-facing bypass as extra safety.
+        front_facing = self._column_is_front_facing(color)
+        if not front_facing and not self._column_line_of_sight_clear(mp):
             return False
         self.update_column_estimation(color, mp)
         est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
         if est is not None:
             self._commit_column_cell(color, (int(round(float(est[0]))),
                                             int(round(float(est[1])))))
+            if ((color == 'blue' and self.start_point is None) or
+                    (color == 'yellow' and self.end_point is None)):
+                self._column_focus_color = color
+                self._column_focus_target = self._column_approach_target(est)
         if color == 'blue':
             self.blue_pos_update_count += 1
         else:
@@ -1300,7 +1808,7 @@ class MyRobot(Robot):
 
     # ── Dynamic path validation and replanning helpers ─────────────────────────
 
-    def _path_blocked(self, path, lookahead=12, cost_thresh=0.65):
+    def _path_blocked(self, path, lookahead=12, cost_thresh=0.82):
         """Return True if any of the next `lookahead` path cells are blocked or
         have high cost near walls. Also consider persistent depth-only obstacles
         that may not yet be reflected in the grid_map."""
@@ -1325,7 +1833,7 @@ class MyRobot(Robot):
                     pass
         return False
 
-    def _path_blocked_from_pose(self, path, lookahead=12, cost_thresh=0.65):
+    def _path_blocked_from_pose(self, path, lookahead=12, cost_thresh=0.82):
         """Check path blocking starting from the closest waypoint to the robot."""
         if path is None or len(path) == 0:
             return False
@@ -1353,44 +1861,146 @@ class MyRobot(Robot):
                 return new
         except Exception:
             pass
-        # 2) Try planner with relaxed cost_map (reduce wall penalty)
+        # 2) Try planner with relaxed cost_map but keep real clearance.
         try:
             if self.occ_map.cost_map is not None:
                 scaled = (self.occ_map.cost_map * 0.2).astype(np.float32)
             else:
                 scaled = None
-            new = self.occ_map.astar_path(start, goal, inflation_levels=[1, 0], cost_map_override=scaled)
+            new = self.occ_map.astar_path(start, goal, inflation_levels=[3, 2], cost_map_override=scaled)
             if new:
                 return new
         except Exception:
             pass
-        # 3) Try ignoring cost map and using minimal inflation (allow narrow passages)
+        # 3) Try ignoring cost map, still with enough inflation to avoid tiny gaps.
         try:
-            new = self.occ_map.astar_path(start, goal, inflation_levels=[0], cost_map_override=None)
+            new = self.occ_map.astar_path(start, goal, inflation_levels=[2], cost_map_override=None)
             if new:
                 return new
         except Exception:
             pass
         return None
 
+    def _path_usable_from_pose(self, path, min_len=3, lookahead=14):
+        if not path or len(path) < min_len:
+            return False
+        grid = self.occ_map.grid_map
+        for px, py in path:
+            x, y = int(px), int(py)
+            if 0 <= x < grid.shape[1] and 0 <= y < grid.shape[0] and grid[y, x] == GREEN_CARPET:
+                return False
+        return not self._path_blocked_from_pose(path, lookahead=lookahead, cost_thresh=0.82)
+
+    def _final_path_clear(self, path, endpoint_margin=2):
+        if not path or len(path) < 2:
+            return False
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        blocked_values = (OBSTACLE, DEPTH_OBSTACLE, CLOSED, GREEN_CARPET)
+        depth_cells = getattr(self.occ_map, '_depth_obstacle_cells', set())
+        for i in range(1, len(path)):
+            x0, y0 = int(path[i - 1][0]), int(path[i - 1][1])
+            x1, y1 = int(path[i][0]), int(path[i][1])
+            cells = utils.ray_cells((x0, y0), (x1, y1))
+            for j, (x, y) in enumerate(cells):
+                if i == 1 and j < endpoint_margin:
+                    continue
+                if i == len(path) - 1 and j >= len(cells) - endpoint_margin:
+                    continue
+                if not (0 <= x < w and 0 <= y < h):
+                    return False
+                if grid[y, x] in blocked_values or (x, y) in depth_cells:
+                    return False
+        return True
+
+    def _final_path_usable(self, path, min_len=3):
+        if not path or len(path) < min_len:
+            return False
+        return self._final_path_clear(path)
+
+    def _final_pillar_access_cell(self, pillar, prefer=None, min_radius=4, max_radius=18):
+        if pillar is None:
+            return None
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        px, py = int(round(float(pillar[0]))), int(round(float(pillar[1])))
+        pref = np.array(prefer if prefer is not None else self.get_map_position(), dtype=float)
+        best, best_score = None, float('inf')
+        for radius in range(min_radius, max_radius + 1):
+            found_at_radius = False
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if abs(dx) != radius and abs(dy) != radius:
+                        continue
+                    x, y = px + dx, py + dy
+                    if not (0 <= x < w and 0 <= y < h):
+                        continue
+                    if grid[y, x] != FREESPACE:
+                        continue
+                    if self.occ_map.cell_blocked((x, y)):
+                        continue
+                    score = float(np.linalg.norm(np.array([x, y], dtype=float) - pref))
+                    if score < best_score:
+                        best_score, best = score, (x, y)
+                        found_at_radius = True
+            if found_at_radius:
+                return best
+        return best
+
+    def _reset_waypoint_follow_state(self):
+        self.follow_target_last_position = None
+        self.follow_target_stuck_count = 0
+        self._phys_stuck_count = 0
+        self._scan_stuck_count = 0
+        self._last_scan_fp = None
+        self._waypoint_motion_commanded = False
+        self._dwa_no_motion_count = 0
+
+    def _refresh_after_recovery(self):
+        try:
+            self._refresh_map_lidar()
+        except Exception:
+            pass
+        try:
+            self._refresh_map_depth()
+        except Exception:
+            pass
+        try:
+            self.occ_map.build_cost_map(force=True)
+        except Exception:
+            pass
+        self._correct_odom_after_collision()
+
+    def _recover_and_replan(self, goal, prefer_frontier=False, min_len=3):
+        """Move out of contact, refresh the map, then return a clear path."""
+        self.stop_motor()
+        self._reset_waypoint_follow_state()
+        self.clear_obstacle(turn_range=(450, 750))
+        self._refresh_after_recovery()
+
+        if self.obstacle_in_front():
+            self.unstick(turn_range=(550, 850))
+            self._refresh_after_recovery()
+
+        planners = []
+        if prefer_frontier:
+            planners.append(lambda: self.occ_map.frontier_path(self.get_map_position(), goal))
+        planners.append(lambda: self._attempt_replan(goal))
+        planners.append(lambda: self.occ_map.astar_path(self.get_map_position(), goal, inflation_levels=[3, 2]))
+        if not prefer_frontier:
+            planners.append(lambda: self.occ_map.frontier_path(self.get_map_position(), goal))
+
+        for plan in planners:
+            try:
+                new = plan()
+            except Exception:
+                new = None
+            if self._path_usable_from_pose(new, min_len=min_len):
+                return list(new)
+        return None
+
     # ── Closure marking ───────────────────────────────────────────────────────
 
-    def _mark_closure(self):
-        now = time.time()
-        if now - self.last_closure_time < self.closure_cooldown:
-            return False
-        try:
-            ok = self.occ_map.stamp_closure(
-                forward_m=CLOSURE_MARK_FORWARD,
-                back_m=CLOSURE_MARK_BACKWARD,
-                width_m=CLOSURE_MARK_WIDTH,
-            )
-            if ok:
-                self.last_closure_time = now
-            return bool(ok)
-        except Exception as e:
-            print(f'[warning] _mark_closure: {e}')
-            return False
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
 
@@ -1399,20 +2009,66 @@ class MyRobot(Robot):
         self.set_robot_velocity(3.0, -3.0)
         steps_done  = 0
         target_steps = 8500 // self.time_step
+        found_sig = None
         while steps_done < target_steps:
             if self.step(self.time_step) == -1:
                 break
             steps_done += 1
             with self.detection_lock:
-                sig = self.camera_detection_signal
+                sig = self._pop_scan_detection_signal()
             if sig is not None:
                 if isinstance(sig, tuple) and sig[0] == 'column':
                     print(f'[Scan] Column {sig[1]} — stopping 360')
+                    found_sig = sig
                     break
-                elif sig in ('red_wall', 'green_carpet'):
+                elif sig == 'green_carpet':
                     print(f'[Scan] {sig} — stopping 360')
+                    found_sig = sig
                     break
         self.stop_motor()
+        return found_sig
+
+    def _suspend_column_focus(self, color, seconds=8.0):
+        if color is None:
+            return
+        self._column_focus_blocked_until[color] = time.time() + seconds
+        if self._column_focus_color == color:
+            self._column_focus_color = None
+            self._column_focus_target = None
+
+    def _clear_frontier_for_column_focus(self):
+        if self._column_focus_target is not None:
+            self._active_frontier_goal = None
+
+    def _handle_scan_signal(self, sig):
+        if sig is None:
+            return False
+        if sig == 'green_carpet':
+            self.mark_green_carpet_permanently(min_pixel_threshold=1500, force=True)
+            return False
+        if isinstance(sig, tuple) and len(sig) >= 2 and sig[0] == 'column':
+            color = sig[1]
+            estimated = self._estimate_column_pos(color)
+            if not estimated:
+                self.center_column_in_view(color)
+                estimated = self._estimate_column_pos(color)
+            committed = self._column_is_committed(color)
+            dist = self.estimate_column_distance(color)
+            if dist is not None and dist < COLOR_DETECTION_DEPTH_THRESHOLD:
+                self.mark_on_map(dist, color=color)
+                committed = self._column_is_committed(color)
+            if estimated and not committed:
+                self.mark_column(color)
+                committed = self._column_is_committed(color)
+            if estimated and not committed:
+                committed = self._commit_column_from_estimate(
+                    color, force=self._column_close_front_visible(color))
+            if committed:
+                self._suspend_column_focus(color, seconds=2.0)
+                return True
+            if not estimated:
+                self._suspend_column_focus(color, seconds=8.0)
+        return False
 
     # ── Frontier selection ────────────────────────────────────────────────────
 
@@ -1432,6 +2088,26 @@ class MyRobot(Robot):
         x0, x1 = max(0, cx - radius), min(w, cx + radius + 1)
         y0, y1 = max(0, cy - radius), min(h, cy + radius + 1)
         return int((grid[y0:y1, x0:x1] == UNKNOWN).sum())
+
+    def _frontier_unknown_target(self, region):
+        if not region:
+            return None
+        rpos = np.array(self.get_map_position(), dtype=float)
+        best_cell, best_score = None, -float('inf')
+        for x, y in region:
+            unknown_score = self._unknown_neighborhood_score(x, y, radius=7)
+            if unknown_score <= 0.0:
+                continue
+            dist = float(np.linalg.norm(np.array([x, y], dtype=float) - rpos)) + 1.0
+            trail_penalty = 0.55 if ((int(x) >> 3, int(y) >> 3) in self._robot_trail) else 1.0
+            score = (unknown_score ** 1.35) * trail_penalty / math.log1p(dist / 6.0)
+            if score > best_score:
+                best_score = score
+                best_cell = (int(x), int(y))
+        if best_cell is not None:
+            return best_cell
+        cells = np.array(region)
+        return (int(np.mean(cells[:, 0])), int(np.mean(cells[:, 1])))
 
     def _score_frontier(self, regions, blacklist=None):
         if not regions:
@@ -1453,8 +2129,15 @@ class MyRobot(Robot):
             if info_gain < 10:
                 continue  # stale — fewer than 10 unknowns in radius
 
-            # Exploration-first: moderate info_gain exponent, stronger distance weight
-            score = (info_gain ** 1.2) * math.log1p(d / 6.0)
+            known_near = max(1, len(region))
+            unknown_ratio = info_gain / float(info_gain + known_near)
+
+            # Exploration-first: prefer frontiers that expand unknown space,
+            # while avoiding long trips through already known cells.
+            local_unknown = self._unknown_neighborhood_score(cx, cy, radius=10)
+            score = ((info_gain ** 1.85) *
+                     (0.25 + 3.5 * unknown_ratio + 2.0 * local_unknown) /
+                     math.log1p(d / 5.0))
 
             # Frontier persistence: strongly prefer continuing into the same unknown
             # region rather than jumping across the map after each frontier.
@@ -1490,8 +2173,11 @@ class MyRobot(Robot):
             return self._score_frontier_fallback(regions, blacklist)
 
         cells = np.array(best_region)
-        return (int(np.mean(cells[:, 0]) + random.randint(-3, 3)),
-                int(np.mean(cells[:, 1]) + random.randint(-3, 3)))
+        target = self._frontier_unknown_target(best_region)
+        if target is not None:
+            return target
+        return (int(np.mean(cells[:, 0]) + random.randint(-2, 2)),
+                int(np.mean(cells[:, 1]) + random.randint(-2, 2)))
 
     def _score_frontier_fallback(self, regions, blacklist=None):
         """Fallback when all frontiers are below info_gain threshold.
@@ -1507,7 +2193,11 @@ class MyRobot(Robot):
             cx, cy   = int(centroid[0]), int(centroid[1])
             d        = float(np.linalg.norm(centroid - rpos)) + 1e-3
             ig       = self._frontier_info_gain(region)
-            score    = (max(ig, 5) ** 1.2) * math.log1p(d / 6.0)
+            unknown_ratio = ig / float(ig + max(1, len(region)))
+            local_unknown = self._unknown_neighborhood_score(cx, cy, radius=10)
+            score    = ((max(ig, 5) ** 1.65) *
+                        (0.25 + 3.0 * unknown_ratio + 1.5 * local_unknown) /
+                        math.log1p(d / 5.0))
             if self._last_frontier_goal is not None:
                 glx, gly = self._last_frontier_goal
                 gdist = math.sqrt((cx - glx) ** 2 + (cy - gly) ** 2)
@@ -1517,8 +2207,11 @@ class MyRobot(Robot):
         if best_region is None:
             return None
         cells = np.array(best_region)
-        return (int(np.mean(cells[:, 0]) + random.randint(-3, 3)),
-                int(np.mean(cells[:, 1]) + random.randint(-3, 3)))
+        target = self._frontier_unknown_target(best_region)
+        if target is not None:
+            return target
+        return (int(np.mean(cells[:, 0]) + random.randint(-2, 2)),
+                int(np.mean(cells[:, 1]) + random.randint(-2, 2)))
 
     def _random_frontier(self, regions):
         if not regions:
@@ -1532,7 +2225,11 @@ class MyRobot(Robot):
             c  = np.array(r, dtype=float).mean(axis=0)
             cx, cy = float(c[0]), float(c[1])
             d  = float(np.linalg.norm(c - rpos)) + 1.0
-            w  = max(0.01, (ig ** 1.2) * math.log1p(d / 6.0))
+            unknown_ratio = ig / float(ig + max(1, len(r)))
+            local_unknown = self._unknown_neighborhood_score(cx, cy, radius=10)
+            w  = max(0.01, ((max(ig, 5) ** 1.65) *
+                            (0.25 + 3.0 * unknown_ratio + 1.5 * local_unknown) /
+                            math.log1p(d / 5.0)))
             if self._last_frontier_goal is not None:
                 glx, gly = self._last_frontier_goal
                 gdist = math.sqrt((cx - glx) ** 2 + (cy - gly) ** 2)
@@ -1540,45 +2237,63 @@ class MyRobot(Robot):
             weights.append(w)
         chosen = random.choices(pool, weights=weights, k=1)[0]
         cells  = np.array(chosen)
-        return (int(np.mean(cells[:, 0]) + random.randint(-3, 3)),
-                int(np.mean(cells[:, 1]) + random.randint(-3, 3)))
+        target = self._frontier_unknown_target(chosen)
+        if target is not None:
+            return target
+        return (int(np.mean(cells[:, 0]) + random.randint(-2, 2)),
+                int(np.mean(cells[:, 1]) + random.randint(-2, 2)))
 
     def _column_biased_target(self, max_jitter=8):
+        if self._column_focus_target is not None:
+            color = self._column_focus_color or 'column'
+            tx, ty = self._column_focus_target
+            if 0 <= tx < self.grid_map.shape[1] and 0 <= ty < self.grid_map.shape[0]:
+                if (self.grid_map[ty, tx] in (FREESPACE, UNKNOWN) and
+                        not self.occ_map.cell_blocked((tx, ty)) and
+                        self._unknown_neighborhood_score(tx, ty, radius=5) > 0.0):
+                    print(f'[Frontier] Focusing {color.upper()} coordinate')
+                    return (int(tx), int(ty))
+            self._column_focus_target = None
+            self._column_focus_color = None
         candidates = []
-        if self.yellow_estimated_pos is not None and self.end_point is None:
+        now = time.time()
+        yellow_blocked = self._column_focus_blocked_until.get('yellow', 0.0) > now
+        blue_blocked = self._column_focus_blocked_until.get('blue', 0.0) > now
+        if self.yellow_estimated_pos is not None and self.end_point is None and not yellow_blocked:
             candidates.append(('yellow', self.yellow_estimated_pos))
-        if self.blue_estimated_pos is not None and self.start_point is None:
+        if self.blue_estimated_pos is not None and self.start_point is None and not blue_blocked:
             candidates.append(('blue', self.blue_estimated_pos))
         if not candidates:
             return None
         color, pos = random.choice(candidates)
-        print(f'[Frontier] Biasing toward {color.upper()}')
-        h, w = self.grid_map.shape
-        for _ in range(100):
-            gx = int(pos[0] + random.randint(-max_jitter, max_jitter))
-            gy = int(pos[1] + random.randint(-max_jitter, max_jitter))
-            if 0 <= gx < w and 0 <= gy < h:
-                if self.grid_map[gy, gx] in (FREESPACE, UNKNOWN):
-                    return (gx, gy)
+        target = self._column_approach_target(pos)
+        if target is not None:
+            print(f'[Frontier] Biasing toward {color.upper()} coordinate')
+            self._column_focus_color = color
+            self._column_focus_target = target
+            self._clear_frontier_for_column_focus()
+            return target
         return None
 
-    def _nearby_free_cell(self, radius=40, max_tries=200):
-        grid  = self.grid_map
-        h, w  = grid.shape
-        rx, ry = self.get_map_position()
-        for _ in range(max_tries):
-            x = int(rx + random.randint(-radius, radius))
-            y = int(ry + random.randint(-radius, radius))
-            if 0 <= x < w and 0 <= y < h and grid[y, x] == FREESPACE:
-                if not self.occ_map.cell_blocked((x, y)):
-                    return (x, y)
-        return None
+    def _column_focus_path(self):
+        target = self._column_biased_target()
+        if target is None:
+            return None
+        start = self.get_map_position()
+        path = self.occ_map.frontier_path(start, target)
+        if not path:
+            path = self.occ_map.astar_path(start, target, inflation_levels=[2, 1, 0])
+        return path
+
 
     # ── Background threads ────────────────────────────────────────────────────
 
     def start_camera_thread(self):
         if self.detection_thread and self.detection_thread.is_alive():
             return
+        with self.detection_lock:
+            self.camera_detection_signal = None
+            self.camera_detection_queue.clear()
         self.camera_thread_running = True
         self.detection_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self.detection_thread.start()
@@ -1612,6 +2327,7 @@ class MyRobot(Robot):
             self._rt_active_path  = None
             self._rt_new_path     = None
             self._rt_replan_ready = False
+            self._rt_last_replan_time = 0.0
         self._rt_planner_running = True
         self._rt_planner_thread  = threading.Thread(
             target=self._realtime_planner_loop, daemon=True)
@@ -1651,7 +2367,7 @@ class MyRobot(Robot):
         live map and replan immediately (same goal) when a segment is blocked."""
         while self._rt_planner_running:
             try:
-                time.sleep(0.08)
+                time.sleep(0.15)
                 with self._rt_planner_lock:
                     goal          = self._rt_planner_goal
                     cur           = self._rt_active_path
@@ -1665,11 +2381,14 @@ class MyRobot(Robot):
                               not self._path_blocked_from_pose(cur, lookahead=20))
                 if path_clear:
                     continue
-                start = tuple(int(v) for v in self.get_map_position())
-                new   = self.occ_map.astar_path(start, goal)
-                if not new or len(new) <= 2:
-                    new = self.occ_map.frontier_path(start, goal)
-                if new and len(new) > 2:
+                now = time.time()
+                if now - self._rt_last_replan_time < 1.0:
+                    continue
+                self._rt_last_replan_time = now
+                new = self._attempt_replan(goal)
+                if not self._path_usable_from_pose(new, min_len=3, lookahead=18):
+                    new = self.occ_map.frontier_path(self.get_map_position(), goal)
+                if self._path_usable_from_pose(new, min_len=3, lookahead=18):
                     with self._rt_planner_lock:
                         self._rt_new_path     = new
                         self._rt_replan_ready = True
@@ -1681,36 +2400,68 @@ class MyRobot(Robot):
     def _camera_loop(self):
         time.sleep(1.0)
         while self.camera_thread_running:
-            time.sleep(0.1)
+            time.sleep(CAMERA_LOOP_INTERVAL)
+            now = time.time()
+            # Maze1 smoothness: while a detection signal is still pending and
+            # unhandled by the main loop, skip ALL image processing this iteration.
+            # The previous code fetched the frame and ran the detectors every tick
+            # regardless, doing redundant heavy work that slowed the simulation.
             with self.detection_lock:
-                if self.camera_detection_signal is not None:
-                    continue
-                if self.there_is_red_wall():
-                    self.camera_detection_signal = 'red_wall'
-                    continue
-                if self.detect_green():
-                    self.camera_detection_signal = 'green_carpet'
-                    continue
-                if self.found_all_2_columns():
-                    continue
-                color = self.detect_column()
-                if color:
-                    if color == 'blue'   and self.start_point is not None:
+                pending = (self.camera_detection_signal is not None or
+                           len(self.camera_detection_queue) > 0)
+            if pending:
+                continue
+            # Run detections outside the lock so each is independent and
+            # the lock is not held during slow image-processing calls.  This ensures
+            # green carpet and column detection are never skipped because the other
+            # detector is slow or triggered a skip condition.
+            # Fetch the camera frame once per iteration and reuse it for both
+            # detectors. Previously detect_green() and detect_column() each called
+            # getImage() + a full BGRA→BGR→HSV conversion, doubling the per-frame
+            # image work in this 10 Hz loop and slowing the simulation.
+            scale = float(CAMERA_DETECTION_SCALE)
+            hsv = self.get_hsv_image(scale=scale)
+            area_scale = max(0.01, scale * scale)
+            green = self.detect_green(hsv, min_pixels=max(8, int(50 * area_scale)))
+            color = None
+            if not self.found_all_2_columns():
+                color = self.detect_column(hsv, min_pixels=max(8, int(20 * area_scale)))
+            with self.detection_lock:
+                candidates = {
+                    'green_carpet': bool(green),
+                    ('column', color) if color else ('column', None): bool(color),
+                }
+                for key, active in candidates.items():
+                    if key == ('column', None):
                         continue
-                    if color == 'yellow' and self.end_point   is not None:
-                        continue
-                    hsv  = self.get_hsv_image()
-                    mask = utils.extract_color_mask(hsv, color) if hsv is not None else None
-                    if mask is not None and self.column_close(mask):
-                        self.center_column_in_view(color)
-                        self.mark_column(color)
-                        self.interrupt_path = True
-                        self.turn_right_milisecond(600)
+                    if active:
+                        self._camera_seen_counts[key] = self._camera_seen_counts.get(key, 0) + 1
                     else:
-                        self.camera_detection_signal = ('column', color)
+                        self._camera_seen_counts[key] = 0
+                if color != 'blue':
+                    self._camera_seen_counts[('column', 'blue')] = 0
+                if color != 'yellow':
+                    self._camera_seen_counts[('column', 'yellow')] = 0
+                if green and self._camera_seen_counts.get('green_carpet', 0) >= CAMERA_SIGNAL_MIN_FRAMES:
+                    self._push_detection_signal('green_carpet')
+                if color and self._camera_seen_counts.get(('column', color), 0) >= CAMERA_SIGNAL_MIN_FRAMES:
+                    if (self._last_column_signal_color == color and
+                            (now - self._last_column_signal_time) < 1.0):
+                        pass  # duplicate within 1 s — do not re-push
+                    elif color == 'blue'   and self.start_point is not None:
+                        pass
+                    elif color == 'yellow' and self.end_point   is not None:
+                        pass
+                    else:
+                        self._last_column_signal_color = color
+                        self._last_column_signal_time  = now
+                        # The camera thread must not call movement helpers: they call
+                        # Robot.step(), which can race the main control loop in Webots.
+                        self._push_detection_signal(('column', color))
 
     def _lidar_loop(self):
         depth_tick = 0
+        last_map_update = -float('inf')
         while self.lidar_thread_running:
             try:
                 if self.lidar is None:
@@ -1719,15 +2470,21 @@ class MyRobot(Robot):
                 if not self.robot_on_ground():
                     time.sleep(0.1)
                     continue
-                if not self.is_turning():
+                try:
+                    now = float(self.getTime())
+                except Exception:
+                    now = time.time()
+                if (not self.is_turning() and
+                        now - last_map_update >= TIME_STEP / 1000.0):
+                    last_map_update = now
                     with self.lidar_lock:
                         self._refresh_map_lidar()
                         depth_tick += 1
-                        if depth_tick % 3 == 0:
+                        if depth_tick % 5 == 0:
                             self._refresh_map_depth()
-                        if depth_tick % 15 == 0:
+                        if depth_tick % 30 == 0:
                             self.occ_map.build_cost_map()
-                time.sleep(0.05)
+                time.sleep(0.002)
             except Exception as e:
                 print(f'[LiDAR] Error: {e}')
                 time.sleep(1.0)
@@ -1746,16 +2503,40 @@ class MyRobot(Robot):
             (x, y, exp) for x, y, exp in self._frontier_blacklist if exp > count]
         bl_positions = [(x, y) for x, y, _ in self._frontier_blacklist]
 
+        focus = self._column_biased_target()
+        if focus is not None:
+            path = self.occ_map.astar_path(self.get_map_position(), focus, inflation_levels=[2, 1, 0])
+            if not path:
+                path = self.occ_map.frontier_path(self.get_map_position(), focus)
+            if path:
+                return regions, focus, path, True
+            self._column_focus_target = None
+            self._column_focus_color = None
+
+        if self._active_frontier_goal is not None:
+            ax, ay = self._active_frontier_goal
+            if self.get_map_distance((ax, ay)) <= PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                self._active_frontier_goal = None
+            elif (0 <= ax < self.grid_map.shape[1] and 0 <= ay < self.grid_map.shape[0] and
+                  not self.occ_map.cell_blocked((ax, ay))):
+                path = self.occ_map.astar_path(self.get_map_position(), (ax, ay), inflation_levels=[2, 1, 0])
+                if not path:
+                    path = self.occ_map.frontier_path(self.get_map_position(), (ax, ay))
+                if path and len(path) > 2:
+                    return regions, (ax, ay), path, False
+                self._active_frontier_goal = None
+            else:
+                self._active_frontier_goal = None
+
         if (count >= EXPLORATION_START_FRONTIER_AFTER and
                 count % EXPLORATION_FRONTIER_SELECTION_FREQ == 0):
             regions = self.occ_map.compute_frontiers()
 
-            if random.random() < 0.9:
-                chosen  = self._column_biased_target()
-                chasing = chosen is not None
+            chosen  = self._column_biased_target()
+            chasing = chosen is not None
 
             if chosen is None:
-                if random.random() < 0.4:
+                if random.random() < 0.90:
                     chosen = self._score_frontier(regions, blacklist=bl_positions)
                     self.chosen_frontier_count += 1
                 else:
@@ -1764,14 +2545,16 @@ class MyRobot(Robot):
 
             if chosen:
                 self._frontier_blacklist.append((chosen[0], chosen[1], count + 100))
-                path = self.occ_map.frontier_path(self.get_map_position(), chosen)
+                path = self.occ_map.astar_path(self.get_map_position(), chosen)
                 if not path:  # narrow corridor — frontier_path inflation may have blocked it
-                    path = self.occ_map.astar_path(self.get_map_position(), chosen)
+                    path = self.occ_map.frontier_path(self.get_map_position(), chosen)
+                if path:
+                    self._active_frontier_goal = tuple(chosen)
 
         return regions, chosen, path, chasing
 
     def navigate_frontier(self, path, replan_interval=20,
-                          drop_on_red_wall=True, use_global_planner=False):
+                          use_global_planner=False):
         if not path:
             return False
 
@@ -1812,44 +2595,40 @@ class MyRobot(Robot):
 
                     sig = None
                     with self.detection_lock:
-                        if self.camera_detection_signal is not None:
-                            sig = self.camera_detection_signal
-                            self.camera_detection_signal = None
+                        sig = self._pop_detection_signal()
 
                     if self.obstacle_in_front():
                         replan_count += 1
-                        self.clear_obstacle()
-                        self._refresh_map_lidar()
-                        if replan_count >= 3:
-                            return False
-                        new = self._attempt_replan(goal)
+                        new = self._recover_and_replan(goal, prefer_frontier=not use_global_planner, min_len=5)
                         if new and len(new) > 5:
                             cur_path = new
                             self.update_realtime_path(cur_path)
                             tidx = 0
+                            last_replan_tick = tick
+                            break
+                        if replan_count >= 4:
+                            return False
+                        continue
+
+                    if self._path_blocked_from_pose(cur_path, lookahead=18, cost_thresh=0.82):
+                        new = self._recover_and_replan(goal, prefer_frontier=not use_global_planner, min_len=5)
+                        if new and len(new) > 5:
+                            cur_path = new
+                            self.update_realtime_path(cur_path)
+                            tidx = 0
+                            last_replan_tick = tick
                             break
                         return False
 
-                    if sig == 'red_wall':
+                    if sig == 'green_carpet':
                         self.stop_motor()
-                        self.align_to_red_wall()
-                        self.stop_motor()
-                        for _ in range(10):
-                            if not self.is_turning(): break
-                            if self.step(self.time_step) == -1: break
-                        self._mark_closure()
-                        for _ in range(10):
-                            if self.step(self.time_step) == -1: break
-                        self.turn_right_milisecond(350)
-                        if drop_on_red_wall:
-                            self.occ_map.visited_frontiers.append(tuple(goal))
+                        self.mark_green_carpet_permanently(min_pixel_threshold=1500, force=True)
+                        time.sleep(0.5)
+                        return False
+                    elif tick % 20 == 0:
+                        if self.detect_green():
                             self.stop_motor()
-                            return False
-
-                    if sig == 'green_carpet' or tick % 20 == 0:
-                        self.stop_motor()
-                        if self.mark_green_carpet_permanently(min_pixel_threshold=10000):
-                            self.stop_motor()
+                            self.mark_green_carpet_permanently(min_pixel_threshold=2500, force=True)
                             time.sleep(0.5)
                             return False
 
@@ -1862,13 +2641,20 @@ class MyRobot(Robot):
                                      if prev_pos is not None else float('inf'))
                         if dist_prev >= 0.8:
                             self.stop_motor()
-                            self.center_column_in_view(color)
-                            if self.get_column_center_pixels(color) >= 8:
-                                self._estimate_column_pos(color)
-                                if color == 'blue':
-                                    self.blue_prev_estimate_position  = cur_pos
-                                else:
-                                    self.yellow_prev_estimate_position = cur_pos
+                            found = self._estimate_column_pos(color)
+                            if not found:
+                                self.center_column_in_view(color)
+                                found = self.get_column_center_pixels(color) >= 4 and self._estimate_column_pos(color)
+                            # Always record attempt position — prevents infinite retry
+                            # from the same spot when the estimation keeps failing.
+                            if color == 'blue':
+                                self.blue_prev_estimate_position  = cur_pos
+                            else:
+                                self.yellow_prev_estimate_position = cur_pos
+                            if found:
+                                self._commit_column_from_estimate(
+                                    color, force=self._column_close_front_visible(color))
+                                return True
 
                     try:
                         interval_hit = bool(replan_interval) and (tick - last_replan_tick >= replan_interval)
@@ -1876,7 +2662,7 @@ class MyRobot(Robot):
                             new = self.occ_map.frontier_path(self.get_map_position(), goal)
                             if not new:
                                 new = self.occ_map.astar_path(self.get_map_position(), goal)
-                            if new and len(new) > 5:
+                            if self._path_usable_from_pose(new, min_len=5):
                                 cur_path = list(new)
                                 self.update_realtime_path(cur_path)
                                 tidx = 0
@@ -1890,8 +2676,7 @@ class MyRobot(Robot):
                         self.occ_map.robot_position  = (int(rx), int(ry))
                         self.occ_map.current_path    = cur_path
                         self.occ_map.target_position = target
-                    if tick % 8 == 0:
-                        self.occ_map.refresh_viz()
+                    self.occ_map.refresh_viz()
 
                     reached, is_stuck = self.advance_to_waypoint(target)
                     if is_stuck:
@@ -1901,22 +2686,15 @@ class MyRobot(Robot):
                             self.stop_motor()
                             return False
                         self.stop_motor()
-                        self._refresh_map_lidar()
-                        self.unstick()
-                        try:
-                            fn  = (self.occ_map.astar_path if use_global_planner
-                                   else self.occ_map.frontier_path)
-                            new = fn(self.get_map_position(), goal)
-                            if new and len(new) > 5:
-                                cur_path = list(new)
-                                self.update_realtime_path(cur_path)
-                                tidx = 0
-                                break
-                            else:
-                                self.occ_map.visited_frontiers.append(tuple(goal))
-                                return False
-                        except Exception:
-                            return False
+                        new = self._recover_and_replan(goal, prefer_frontier=not use_global_planner, min_len=5)
+                        if new and len(new) > 5:
+                            cur_path = list(new)
+                            self.update_realtime_path(cur_path)
+                            tidx = 0
+                            last_replan_tick = tick
+                            break
+                        self.occ_map.visited_frontiers.append(tuple(goal))
+                        return False
                     if reached:
                         break
 
@@ -1950,22 +2728,37 @@ class MyRobot(Robot):
         goal = tuple(path[-1])
         if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
             self.stop_motor()
+            print('[FinalPath] Already at goal')
             return True
 
-        def _plan():
+        def _plan_from_current():
             start = tuple(self.get_map_position())
             try:
-                return self.occ_map.astar_path(start, goal)
+                new = self.occ_map.astar_path(start, goal)
+                return new if self._final_path_usable(new) else None
             except Exception as e:
                 print(f'[FinalPath] planner error: {e}')
                 return None
 
-        cur_path = _plan() or list(path)
+        # Reference-style final follow, but preserve the final pillar-to-pillar
+        # route produced by explore() instead of replacing it at startup.
+        cur_path = list(path)
+        if not self._final_path_usable(cur_path):
+            cur_path = _plan_from_current()
+            if not self._final_path_usable(cur_path):
+                print('[FinalPath] No wall-clear path available')
+                return False
+
+        with self.occ_map.vis_lock:
+            rx, ry = self.get_map_position()
+            self.occ_map.robot_position  = (int(rx), int(ry))
+            self.occ_map.current_path    = cur_path
+            self.occ_map.target_position = goal
+        if debug_vis:
+            self.occ_map.refresh_viz()
 
         try:
-            # Use a waypoint further ahead for a stable direction estimate;
-            # path[1] is too close and noisy when the spline is dense.
-            align_idx = min(10, len(cur_path) - 1)
+            align_idx = min(1, len(cur_path) - 1)
             self.align_to_path(cur_path[align_idx])
         except Exception:
             pass
@@ -1974,7 +2767,12 @@ class MyRobot(Robot):
             p = list(p)
             if len(p) <= 1:
                 return [goal]
-            stride = 1
+            if len(p) < 25:
+                stride = 3
+            elif len(p) < 60:
+                stride = 4
+            else:
+                stride = 5
             idxs   = list(range(stride, len(p), stride))
             if len(p) - 1 not in idxs:
                 idxs.append(len(p) - 1)
@@ -1984,180 +2782,159 @@ class MyRobot(Robot):
         waypoints = _build_waypoints(cur_path)
         tick = 0
         i    = 0
-        last_replan_tick = -max(1, replan_interval or 1)
+        last_replan_tick = 0
+        map_wait_steps = 40
 
         self.start_realtime_planner(goal)
+        self.update_realtime_path(cur_path)
         try:
-          while i < len(waypoints):
-            target = waypoints[i]
-            while self.step(self.time_step) != -1:
-                tick += 1
+            while i < len(waypoints):
+                target = waypoints[i]
+                while self.step(self.time_step) != -1:
+                    tick += 1
 
-                rt = self.poll_realtime_planner()
-                if rt:
-                    cur_path  = rt
-                    waypoints = _build_waypoints(cur_path)
-                    i = -1  # outer loop adds 1 → starts at waypoints[0]
-                    with self.occ_map.vis_lock:
-                        self.occ_map.current_path = cur_path
-                    print('[RT-Planner] Path swapped in follow_final_path')
-                    break
-
-                sig = None
-                with self.detection_lock:
-                    if self.camera_detection_signal is not None:
-                        sig = self.camera_detection_signal
-                        self.camera_detection_signal = None
-
-                if sig == 'red_wall':
-                    self.stop_motor()
-                    try:
-                        self.align_to_red_wall()
-                        self.stop_motor()
-                    except Exception:
-                        pass
-                    for _ in range(10):
-                        if not self.is_turning(): break
-                        if self.step(self.time_step) == -1: break
-                    try:
-                        self._mark_closure()
-                    except Exception:
-                        pass
-                    for _ in range(10):
-                        if self.step(self.time_step) == -1: break
-                    try:
-                        self.turn_right_milisecond(350)
-                    except Exception:
-                        pass
-                    for _ in range(40):
-                        if self.step(self.time_step) == -1:
-                            self.stop_motor()
-                            return False
-                    new = _plan()
-                    if new and len(new) > 2:
-                        cur_path  = list(new)
-                        waypoints = _build_waypoints(cur_path)
-                        i = -1  # outer loop adds 1 → starts at waypoints[0]
-                        break
-                    else:
-                        self.stop_motor()
-                        return False
-
-                if isinstance(sig, tuple) and len(sig) >= 2 and sig[0] == 'column':
-                    _, color = sig
-                    try:
-                        ratio = self.get_column_center_ratio(color)
-                        d     = self.estimate_column_distance(color)
-                        close = (d is not None and d < COLOR_DETECTION_DEPTH_THRESHOLD)
-                        if ratio >= 0.20 or close:
-                            self.stop_motor()
-                            for _ in range(10):
-                                if not self.is_turning(): break
-                                if self.step(self.time_step) == -1: break
-                            self.center_column_in_view(color)
-                            dist = self.estimate_column_distance(color)
-                            if dist is not None:
-                                self.mark_on_map(dist, color=color)
-                            else:
-                                self.mark_column(color)
-                        else:
-                            self._estimate_column_pos(color)
-                    except Exception:
-                        pass
-
-                if tick % 10 == 0:
-                    try:
-                        self.mark_green_carpet_permanently(min_pixel_threshold=10000)
-                    except Exception:
-                        pass
-
-                try:
-                    blocked = self._path_blocked_from_pose(cur_path, lookahead=24)
-                    interval_hit = bool(replan_interval) and (tick - last_replan_tick >= replan_interval)
-                    if blocked or interval_hit:
-                        new = self._attempt_replan(goal)
-                        if new and len(new) > 2:
-                            cur_path = list(new)
-                            waypoints = _build_waypoints(cur_path)
-                            i = -1  # outer loop adds 1 → starts at waypoints[0]
-                            last_replan_tick = tick
-                            break
-                        new = _plan()
-                        if new and len(new) > 2:
-                            cur_path = list(new)
-                            waypoints = _build_waypoints(cur_path)
-                            i = -1
-                            last_replan_tick = tick
-                            break
-                        try:
-                            self.avoid_obstacle()
-                        except Exception:
-                            pass
-                        self._correct_odom_after_collision()
-                        for _ in range(30):
-                            if self.step(self.time_step) == -1: break
-                        new = _plan()
-                        if new and len(new) > 2:
-                            cur_path = list(new)
-                            waypoints = _build_waypoints(cur_path)
-                            i = -1
-                            last_replan_tick = tick
-                            break
-                except Exception:
-                    pass
-
-                with self.occ_map.vis_lock:
-                    rx, ry = self.get_map_position()
-                    self.occ_map.robot_position  = (int(rx), int(ry))
-                    self.occ_map.current_path    = cur_path
-                    self.occ_map.target_position = target
-                if tick % 8 == 0:
-                    self.occ_map.refresh_viz()
-
-                reached, is_stuck = self.advance_to_waypoint(target)
-                if is_stuck or (len(self.get_distances()) and
-                                min(self.get_distances()) < 0.05):
-                    self.stop_motor()
-                    try:
-                        self.unstick()
-                    except Exception:
-                        pass
-                    for _ in range(40):
-                        if self.step(self.time_step) == -1: break
-                    new = _plan()
-                    if new and len(new) > 2:
-                        cur_path  = list(new)
-                        waypoints = _build_waypoints(cur_path)
-                        i = -1  # outer loop adds 1 → starts at waypoints[0]
-                        break
-                    try:
-                        self.avoid_obstacle()
-                    except Exception:
-                        pass
-                    self._correct_odom_after_collision()
-                    for _ in range(30):
-                        if self.step(self.time_step) == -1: break
-                    new = _plan()
-                    if new and len(new) > 2:
-                        cur_path  = list(new)
+                    rt = self.poll_realtime_planner()
+                    if rt and self._final_path_usable(rt):
+                        cur_path = list(rt)
+                        self.update_realtime_path(cur_path)
                         waypoints = _build_waypoints(cur_path)
                         i = -1
+                        with self.occ_map.vis_lock:
+                            self.occ_map.current_path = cur_path
+                        print('[RT-Planner] Path swapped in follow_final_path')
                         break
-                    print(f'[FinalPath] Recovery: skipping waypoint {i}, continuing')
-                    i += 1
-                    break
 
-                if reached:
-                    if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                    sig = None
+                    with self.detection_lock:
+                        sig = self._pop_detection_signal()
+
+                    if sig == 'green_carpet':
+                        self.mark_green_carpet_permanently(min_pixel_threshold=1500, force=True)
+
+                    if isinstance(sig, tuple) and len(sig) >= 2 and sig[0] == 'column':
+                        _, color = sig
+                        try:
+                            ratio = self.get_column_center_ratio(color)
+                            d     = self.estimate_column_distance(color)
+                            close = (d is not None and d < COLOR_DETECTION_DEPTH_THRESHOLD)
+                            if close:
+                                self.stop_motor()
+                                for _ in range(10):
+                                    if not self.is_turning(): break
+                                    if self.step(self.time_step) == -1: break
+                                found = self._estimate_column_pos(color)
+                                if not found:
+                                    self.center_column_in_view(color)
+                                    found = self._estimate_column_pos(color)
+                                dist = self.estimate_column_distance(color)
+                                if dist is not None:
+                                    self.mark_on_map(dist, color=color)
+                                if found and not self._column_is_committed(color):
+                                    self.mark_column(color)
+                                if found and not self._column_is_committed(color):
+                                    self._commit_column_from_estimate(color)
+                        except Exception:
+                            pass
+
+                    if tick % 5 == 0:
+                        try:
+                            if self.detect_green():
+                                self.mark_green_carpet_permanently(min_pixel_threshold=2500, force=True)
+                        except Exception:
+                            pass
+
+                    if self.obstacle_in_front():
+                        new = self._recover_and_replan(goal, prefer_frontier=False, min_len=3)
+                        if self._final_path_usable(new):
+                            cur_path = list(new)
+                            self.update_realtime_path(cur_path)
+                            waypoints = _build_waypoints(cur_path)
+                            i = -1
+                            last_replan_tick = tick
+                            break
+                        for _ in range(map_wait_steps):
+                            if self.step(self.time_step) == -1:
+                                self.stop_motor()
+                                return False
+                        new = _plan_from_current()
+                        if self._final_path_usable(new):
+                            cur_path = list(new)
+                            self.update_realtime_path(cur_path)
+                            waypoints = _build_waypoints(cur_path)
+                            i = -1
+                            last_replan_tick = tick
+                            break
+                        print('[FinalPath] Replan failed after obstacle; continuing supplied path')
+
+                    try:
+                        blocked = self._path_blocked_from_pose(cur_path, lookahead=24)
+                        interval_hit = bool(replan_interval) and (tick - last_replan_tick >= replan_interval)
+                        if blocked or (interval_hit and not self._path_usable_from_pose(cur_path, min_len=3, lookahead=24)):
+                            new = self._attempt_replan(goal)
+                            if self._final_path_usable(new):
+                                cur_path = list(new)
+                                self.update_realtime_path(cur_path)
+                                waypoints = _build_waypoints(cur_path)
+                                i = -1
+                                last_replan_tick = tick
+                                break
+                            new = _plan_from_current()
+                            if self._final_path_usable(new):
+                                cur_path = list(new)
+                                self.update_realtime_path(cur_path)
+                                waypoints = _build_waypoints(cur_path)
+                                i = -1
+                                last_replan_tick = tick
+                                break
+                            last_replan_tick = tick
+                    except Exception:
+                        pass
+
+                    with self.occ_map.vis_lock:
+                        rx, ry = self.get_map_position()
+                        self.occ_map.robot_position  = (int(rx), int(ry))
+                        self.occ_map.current_path    = cur_path
+                        self.occ_map.target_position = target
+                    self.occ_map.refresh_viz()
+
+                    reached, is_stuck = self.advance_to_waypoint(target)
+                    if is_stuck or (len(self.get_distances()) and
+                                    min(self.get_distances()) < 0.05):
                         self.stop_motor()
-                        print('[FinalPath] Goal reached')
-                        return True
-                    break
-            i += 1
-            if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
-                self.stop_motor()
-                print('[FinalPath] Goal reached (post-check)')
-                return True
+                        new = self._recover_and_replan(goal, prefer_frontier=False, min_len=3)
+                        if self._final_path_usable(new):
+                            cur_path  = list(new)
+                            self.update_realtime_path(cur_path)
+                            waypoints = _build_waypoints(cur_path)
+                            i = -1
+                            last_replan_tick = tick
+                            break
+                        for _ in range(map_wait_steps):
+                            if self.step(self.time_step) == -1:
+                                self.stop_motor()
+                                return False
+                        new = _plan_from_current()
+                        if self._final_path_usable(new):
+                            cur_path  = list(new)
+                            self.update_realtime_path(cur_path)
+                            waypoints = _build_waypoints(cur_path)
+                            i = -1
+                            last_replan_tick = tick
+                            break
+                        print(f'[FinalPath] Recovery: skipping waypoint {i}, continuing')
+                        break
+
+                    if reached:
+                        if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                            self.stop_motor()
+                            print('[FinalPath] Goal reached')
+                            return True
+                        break
+                i += 1
+                if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                    self.stop_motor()
+                    print('[FinalPath] Goal reached (post-check)')
+                    return True
         finally:
             self.stop_realtime_planner()
 
@@ -2169,6 +2946,10 @@ class MyRobot(Robot):
     # ── Main exploration loop ─────────────────────────────────────────────────
 
     def explore(self, debug=True):
+        self.stop_realtime_planner()
+        self.stop_camera_thread()
+        self.stop_lidar_thread()
+        self._reset_transient_depth_obstacles()
         self.start_camera_thread()
         self.start_lidar_thread()
 
@@ -2180,30 +2961,20 @@ class MyRobot(Robot):
         count     = 0
 
         time.sleep(0.2)
-        self.scan_360()
+        initial_sig = self.scan_360()
+        initial_committed = self._handle_scan_signal(initial_sig)
+        if isinstance(initial_sig, tuple) and len(initial_sig) >= 2 and initial_sig[0] == 'column':
+            print(f'[Scan] Initial {initial_sig[1]} committed={initial_committed} '
+                  f'blue={self.start_point is not None} yellow={self.end_point is not None}')
 
         while self.step(self.time_step) != -1 and not self.found_all_2_columns():
 
             with self.detection_lock:
-                sig = self.camera_detection_signal
-                self.camera_detection_signal = None
-
-            if sig == 'red_wall':
-                self.stop_motor()
-                self.align_to_red_wall()
-                self.stop_motor()
-                for _ in range(10):
-                    if not self.is_turning(): break
-                    if self.step(self.time_step) == -1: break
-                self._mark_closure()
-                for _ in range(5):
-                    if self.step(self.time_step) == -1: break
-                self.turn_right_milisecond(350)
-                continue
+                sig = self._pop_detection_signal()
 
             if sig == 'green_carpet':
                 self.stop_motor()
-                self.mark_green_carpet_permanently(min_pixel_threshold=10000)
+                self.mark_green_carpet_permanently(min_pixel_threshold=1500, force=True)
                 continue
 
             if isinstance(sig, tuple) and len(sig) == 2:
@@ -2215,13 +2986,23 @@ class MyRobot(Robot):
                              if prev_pos is not None else float('inf'))
                 if dist_prev >= 0.8:
                     self.stop_motor()
-                    self.center_column_in_view(color)
-                    if self.get_column_center_pixels(color) >= 8:
-                        self._estimate_column_pos(color)
-                        if color == 'blue':
-                            self.blue_prev_estimate_position  = cur_pos
-                        else:
-                            self.yellow_prev_estimate_position = cur_pos
+                    found = self._estimate_column_pos(color)
+                    if not found:
+                        self.center_column_in_view(color)
+                        found = self.get_column_center_pixels(color) >= 4 and self._estimate_column_pos(color)
+                    # Always record the attempt position so the robot must move
+                    # before retrying — prevents the infinite-stop-retry loop when
+                    # the estimation keeps failing from the same spot.
+                    if color == 'blue':
+                        self.blue_prev_estimate_position  = cur_pos
+                    else:
+                        self.yellow_prev_estimate_position = cur_pos
+                    if found:
+                        self._commit_column_from_estimate(
+                            color, force=self._column_close_front_visible(color))
+                        focus_path = self._column_focus_path()
+                        if focus_path and len(focus_path) > 2:
+                            self.navigate_frontier(focus_path)
                 continue
 
             map_diff = utils.map_delta_ratio(prev_grid, self.occ_map.grid_map)
@@ -2231,21 +3012,19 @@ class MyRobot(Robot):
             # navigated internally AND the outer loop also tried to navigate.
             _, chosen, path_to_chosen, chasing = self._update_frontier(count, map_diff)
 
-            # Fallback: if no frontier path, occasionally explore a nearby free cell
-            if path_to_chosen is None and random.random() < 0.2:
-                fb = self._nearby_free_cell()
-                if fb is not None:
-                    chosen         = fb
-                    path_to_chosen = self.occ_map.frontier_path(self.get_map_position(), chosen)
-                    chasing        = False
-
             # One navigation call per iteration — no competing goals
             if path_to_chosen:
                 ok = self.navigate_frontier(path_to_chosen)
                 if ok:
                     self._last_frontier_goal = chosen
+                    if self._active_frontier_goal == tuple(chosen):
+                        self._active_frontier_goal = None
                 if ok and chasing and not self.found_all_2_columns():
-                    self.scan_360()
+                    scan_sig = self.scan_360()
+                    committed = self._handle_scan_signal(scan_sig)
+                    if (not committed and isinstance(scan_sig, tuple) and
+                            len(scan_sig) >= 2 and scan_sig[0] == 'column'):
+                        self._suspend_column_focus(scan_sig[1], seconds=8.0)
 
             prev_grid = self.occ_map.grid_map.copy()
 
@@ -2265,8 +3044,7 @@ class MyRobot(Robot):
                                         int(self.yellow_estimated_pos[1]),
                                         (255, 255, 0)))
                     self.occ_map.column_points = col_pts
-                if count % 8 == 0:
-                    self.occ_map.refresh_viz()
+                self.occ_map.refresh_viz()
 
             count += 1
 
@@ -2275,6 +3053,7 @@ class MyRobot(Robot):
         self.occ_map.stop_viz()
         with self.detection_lock:
             self.camera_detection_signal  = None
+            self.camera_detection_queue.clear()
             self.green_carpet_active      = False
             self.last_green_carpet_points = []
             time.sleep(0.5)
@@ -2284,18 +3063,42 @@ class MyRobot(Robot):
         if self.start_point is not None and self.end_point is not None:
             blue   = tuple(self.start_point)
             yellow = tuple(self.end_point)
-            if self.last_found_color == 'yellow':
-                start, end = yellow, blue
+            # Plan the final path pillar-to-pillar with A*, not from the robot's
+            # current pose. Start at the latest detected pillar, then go to the
+            # other one.
+            route_start_color = self.last_found_color or self.first_found_color
+            if route_start_color == 'yellow':
+                start_pillar, end_pillar = yellow, blue
             else:
-                start, end = blue, yellow
-            return self.find_path(start, end)
+                start_pillar, end_pillar = blue, yellow
+            start_access = self._final_pillar_access_cell(
+                start_pillar, prefer=self.get_map_position())
+            end_access = self._final_pillar_access_cell(
+                end_pillar, prefer=start_access or self.get_map_position())
+            if start_access is None or end_access is None:
+                print('[Explore] WARNING: both pillars found but no free access '
+                      'cell exists near a pillar.')
+                return []
+            # Both pillars are known, but final execution must not accept a route
+            # that crosses real obstacle cells. Try thinner inflation if needed,
+            # then validate the returned cells against the current map.
+            path = self.find_path(start_access, end_access)
+            if not self._final_path_usable(path):
+                path = self.occ_map.astar_path(
+                    start_access, end_access, inflation_levels=[2, 1, 0])
+            if not self._final_path_usable(path):
+                path = None
+            if path:
+                print(f'[Explore] Final pillar-to-pillar path: {len(path)} waypoints')
+            else:
+                print('[Explore] WARNING: both pillars found but planner returned '
+                      'no wall-clear path.')
+            return path or []
         return []
 
     def find_path(self, start, end):
         return self.occ_map.astar_path(start, end)
 
-    def find_path_for_frontier(self, start, end):
-        return self.occ_map.frontier_path(start, end)
 
     # ── Green carpet ──────────────────────────────────────────────────────────
 
@@ -2307,7 +3110,9 @@ class MyRobot(Robot):
         kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT,
             (GREEN_CARPET_DILATION_KERNEL_SIZE, GREEN_CARPET_DILATION_KERNEL_SIZE))
-        green_mask = cv2.dilate(green_mask, kernel, iterations=GREEN_CARPET_DILATION_ITERATIONS)
+        if GREEN_CARPET_DILATION_ITERATIONS > 0:
+            green_mask = cv2.dilate(green_mask, kernel, iterations=GREEN_CARPET_DILATION_ITERATIONS)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         h_start = int(self.cam_height * 0.5)
         green_mask[:h_start, :] = 0
         try:
@@ -2326,16 +3131,16 @@ class MyRobot(Robot):
         x_n = (u_px - self.cx) / self.fx
         y_n = (v_px - self.cy) / self.fy
         D   = self.camera_height_m / (y_n + 1e-6)
-        ok  = (y_n > 0.001) & (D > 0.1) & (D < 4.0)
+        ok  = (y_n > 0.001) & (D > 0.1) & (D < GREEN_CARPET_MAX_PROJECTION_DISTANCE)
         D_v, x_nv = D[ok], x_n[ok]
         pts_local = np.stack([D_v + self.X_offset, -D_v * x_nv + self.Y_offset], axis=1)
         pts_world = self.transform_points_to_world(pts_local)
         return self.convert_to_map_coordinate_matrix(pts_world)
 
     def mark_green_carpet_permanently(self, min_pixel_threshold=10,
-                                      new_area_threshold=0.5):
+                                      new_area_threshold=0.5, force=False):
         now = time.time()
-        if (now - self.last_green_mark_time) < self.green_mark_cooldown:
+        if not force and (now - self.last_green_mark_time) < self.green_mark_cooldown:
             return False
         if not self.green_carpet_lock.acquire(blocking=False):
             return False
@@ -2355,6 +3160,9 @@ class MyRobot(Robot):
             if np.sum(~green_protect[yi, xi]) / xi.size < new_area_threshold:
                 return False
             centroid   = np.array([float(np.mean(xi)), float(np.mean(yi))])
+            robot_mp = self.get_map_position()
+            if np.linalg.norm(centroid - np.array(robot_mp, dtype=float)) > GREEN_CARPET_MARK_MAX_MAP_DISTANCE:
+                return False
             min_d, closest_idx = float('inf'), -1
             for i, (ox, oy, _) in enumerate(self.green_carpet_patches):
                 d = np.linalg.norm(centroid - np.array([ox, oy]))
@@ -2371,8 +3179,12 @@ class MyRobot(Robot):
             self._back_from_green()
             self.stop_motor()
             time.sleep(1.0)
+            confirm_threshold = max(
+                50,
+                int(min_pixel_threshold * GREEN_CARPET_CONFIRM_MIN_POINTS_RATIO)
+            )
             cur_pts = self.get_green_carpet_points()
-            if cur_pts.shape[0] < min_pixel_threshold:
+            if cur_pts.shape[0] < confirm_threshold:
                 return False
             pts2 = cur_pts.astype(np.int32)
             xi2, yi2 = pts2[:, 0], pts2[:, 1]
@@ -2380,11 +3192,23 @@ class MyRobot(Robot):
             xi2, yi2 = xi2[valid2], yi2[valid2]
             if xi2.size == 0:
                 return False
+            # Hard per-cell guard: drop any projected carpet cell farther than the
+            # max-cell distance from the robot. This guarantees the carpet is never
+            # plotted from far away even when the centroid passes the gate above.
+            rmp = np.array(self.get_map_position(), dtype=np.float32)
+            cell_d = np.hypot(xi2 - rmp[0], yi2 - rmp[1])
+            near = cell_d <= GREEN_CARPET_MAX_CELL_MAP_DISTANCE
+            xi2, yi2 = xi2[near], yi2[near]
+            if xi2.size == 0:
+                return False
+            centroid2 = np.array([float(np.mean(xi2)), float(np.mean(yi2))])
+            if np.linalg.norm(centroid2 - np.array(self.get_map_position(), dtype=float)) > GREEN_CARPET_MARK_MAX_MAP_DISTANCE:
+                return False
             try:
                 fill_mask = np.zeros(self.occ_map.grid_map.shape, dtype=np.uint8)
                 fill_mask[yi2, xi2] = 1
-                kernel = np.ones((3, 3), dtype=np.uint8)
-                fill_mask = cv2.morphologyEx(fill_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                kernel = np.ones((2, 2), dtype=np.uint8)
+                fill_mask = cv2.morphologyEx(fill_mask, cv2.MORPH_OPEN, kernel, iterations=1)
                 self.occ_map.grid_map[fill_mask == 1] = int(GREEN_CARPET)
                 if min_d >= self.green_carpet_proximity_threshold:
                     self.green_carpet_patches.append((centroid[0], centroid[1], int(xi2.size)))

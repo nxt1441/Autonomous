@@ -78,10 +78,6 @@ def ray_cells(start, end):
 
 
 def extract_color_mask(hsv_img, color):
-    if color == 'red':
-        m1 = cv2.inRange(hsv_img, np.array(RED_WALL_HSV_LOWER1), np.array(RED_WALL_HSV_UPPER1))
-        m2 = cv2.inRange(hsv_img, np.array(RED_WALL_HSV_LOWER2), np.array(RED_WALL_HSV_UPPER2))
-        return cv2.bitwise_or(m1, m2)
     if color == 'blue':
         return cv2.inRange(hsv_img, np.array(BLUE_HSV_LOWER), np.array(BLUE_HSV_UPPER))
     if color == 'yellow':
@@ -89,18 +85,6 @@ def extract_color_mask(hsv_img, color):
     if color == 'green':
         return cv2.inRange(hsv_img, np.array(GREEN_HSV_LOWER), np.array(GREEN_HSV_UPPER))
     return None
-
-
-def red_wall_centered(hsv_img):
-    mask = extract_color_mask(hsv_img, 'red')
-    if cv2.countNonZero(mask) == 0:
-        return False, mask
-    h, w, _ = hsv_img.shape
-    border = 30
-    if (np.any(mask[:border, :]) or np.any(mask[h - border:, :]) or
-            np.any(mask[:, :border]) or np.any(mask[:, w - border:])):
-        return False, mask
-    return True, mask
 
 
 def map_delta_ratio(map1, map2):
