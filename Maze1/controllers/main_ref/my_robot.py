@@ -811,10 +811,10 @@ class MyRobot(Robot):
                 u_col = int(uu[i])
                 v_row = int(vv[i])
                 d_ref = float(d[i])
-                # Skip only obvious background behind a closer surface. A lower
-                # threshold drops the rear/side edge of floating planes, so the
-                # map never gets updated from the opposite approach angle.
-                if d_ref - min_depth_per_col[u_col] > 0.30:
+                # Only stamp the nearest visible surface for this bearing. When
+                # the robot faces a panel from the front, farther top/back-edge
+                # pixels can otherwise project into the corridor behind it.
+                if d_ref - min_depth_per_col[u_col] > DEPTH_OBSTACLE_OCCLUDED_SURFACE_DEPTH_GAP:
                     support_ok[i] = True  # treat as supported so it is excluded
                     continue
                 for sv in range(v_row + 1, h):
