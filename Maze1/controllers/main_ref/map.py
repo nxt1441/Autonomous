@@ -44,7 +44,12 @@ def _plotter_process_main(frame_queue, stop_event, size, parent_pid):
         ax.set_title('Occupancy Grid - Live')
         ax.axis('off')
         blank = np.full((size, size, 3), 80, dtype=np.uint8)
-        im = ax.imshow(blank, interpolation='bilinear')
+        # 'nearest', not 'bilinear': this is a categorical/label image (each
+        # colour is a discrete map state), not continuous data. Bilinear
+        # blending fabricates fake intermediate colours at every cell
+        # boundary (e.g. a red/white edge rendering as pink) that don't
+        # correspond to any real map state, actively hurting readability.
+        im = ax.imshow(blank, interpolation='nearest')
         fig.tight_layout()
         fig.canvas.draw()
         try:
@@ -220,19 +225,23 @@ class MapRenderer:
                     if 0 <= nx < w and 0 <= ny < h:
                         rgb[ny, nx] = color
 
+        # Path/target/start markers deliberately avoid the base grid's own
+        # semantic colours (red = floating wall/DEPTH_OBSTACLE, green =
+        # GREEN_CARPET, blue = BLUE_COLUMN) so an overlay marker can never
+        # be mistaken for the map data it's drawn on top of.
         if path:
             for px, py in path:
                 px, py = int(px), int(py)
                 if 0 <= px < w and 0 <= py < h:
-                    rgb[py, px] = (255, 0, 0)
+                    rgb[py, px] = (255, 0, 255)  # magenta
         if target:
-            _mark(target[0], target[1], (0, 255, 0), r=4)
+            _mark(target[0], target[1], (255, 140, 0), r=4)  # orange
         if columns:
             for col in columns:
                 if isinstance(col, (list, tuple)) and len(col) >= 3:
                     _mark(col[0], col[1], col[2], r=2)
         if start_point:
-            _mark(start_point[0], start_point[1], (0, 0, 255), r=6)
+            _mark(start_point[0], start_point[1], (0, 255, 255), r=6)  # cyan
         if end_point:
             _mark(end_point[0], end_point[1], (255, 200, 0), r=6)
         if robot_pos:
@@ -247,8 +256,12 @@ class MapRenderer:
                 _mark(fx, fy, (255, 0, 0), r=2)
 
         if MAP_RENDER_SCALE > 1:
+            # INTER_NEAREST, not INTER_LINEAR: same reasoning as the
+            # matplotlib imshow call above -- this upscales discrete
+            # category colours, and linear blending would blur crisp cell
+            # boundaries into misleading intermediate colours.
             rgb = cv2.resize(rgb, (w * MAP_RENDER_SCALE, h * MAP_RENDER_SCALE),
-                             interpolation=cv2.INTER_LINEAR)
+                             interpolation=cv2.INTER_NEAREST)
         return rgb
 
     def shutdown(self):
@@ -482,31 +495,29 @@ class OccupancyGrid:
     # ── Path planning ─────────────────────────────────────────────────────────
 
     def astar_path(self, start, end, inflation_levels=None, cost_map_override=None,
-                   relaxed_clearance=False):
+                    min_clearance_pixels=None):
         """A* wrapper that tries multiple obstacle inflation levels.
 
         Parameters:
         - start, end: map coordinates
         - inflation_levels: list of inflation pixel values to try (defaults to ASTAR_INFLATION_LEVELS)
         - cost_map_override: numpy array to pass to the planner instead of self.cost_map
-        - relaxed_clearance: when True, skip the minimum-clearance rejection so a tight
-          but valid corridor still yields a path (used as a last-resort fallback).
+        - min_clearance_pixels: extra post-search clearance re-check margin
+          (defaults to ASTAR_MIN_CLEARANCE_PIXELS). This is applied on top of
+          `inflation` for every level tried below, so passing looser
+          inflation_levels alone cannot relax it -- callers that need a
+          genuinely tighter squeeze (e.g. right next to a pillar) must lower
+          this explicitly too.
         """
         if inflation_levels is None:
             inflation_levels = ASTAR_INFLATION_LEVELS
-        sx, sy = int(start[0]), int(start[1])
-        ex, ey = int(end[0]), int(end[1])
-        if not (0 <= sx < self.map_size and 0 <= sy < self.map_size and
-                0 <= ex < self.map_size and 0 <= ey < self.map_size):
-            return None
+        if min_clearance_pixels is None:
+            min_clearance_pixels = ASTAR_MIN_CLEARANCE_PIXELS
         best_path, best_len = None, float('inf')
         fallback_path, fallback_len = None, 0.0
-        base_snapshot = self.grid_map.copy().astype(np.float32)
         cost_map_to_use = self.cost_map if cost_map_override is None else cost_map_override
-        if cost_map_to_use is not None:
-            cost_map_to_use = cost_map_to_use.copy()
         for inflation in inflation_levels:
-            base = base_snapshot.copy()
+            base = self.grid_map.copy().astype(np.float32)
             base[base == DEPTH_OBSTACLE] = OBSTACLE
             c_mask = (base == CLOSED)
             g_mask = (base == GREEN_CARPET)
@@ -528,8 +539,8 @@ class OccupancyGrid:
             if any(g_mask[int(py), int(px)] for px, py in path
                    if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
                 continue
-            if not relaxed_clearance:
-                clearance_tmp = utils.dilate_obstacles(tmp.copy(), inflation_pixels=ASTAR_MIN_CLEARANCE_PIXELS)
+            if min_clearance_pixels > 0:
+                clearance_tmp = utils.dilate_obstacles(tmp.copy(), inflation_pixels=min_clearance_pixels)
                 if any(clearance_tmp[int(py), int(px)] == OBSTACLE for px, py in path[2:-2]
                        if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
                     continue
@@ -547,28 +558,10 @@ class OccupancyGrid:
                     best_len, best_path = total, path
             elif total > fallback_len:
                 fallback_len, fallback_path = total, path
-        result = best_path if best_path is not None else fallback_path
-        if result is None and not relaxed_clearance:
-            # Every inflation level found either no path or one that fails the
-            # strict ASTAR_MIN_CLEARANCE_PIXELS margin. That margin is a safety
-            # pad on top of the obstacle inflation already applied above, not
-            # the real robot footprint — a tight-but-genuinely-traversable
-            # corridor gets rejected here even though it's actually fine. This
-            # `relaxed_clearance` last resort exists for exactly that case but
-            # was never being triggered by any caller, so it silently returned
-            # "no path" for a corridor the robot could really drive through.
-            return self.astar_path(start, end, inflation_levels=inflation_levels,
-                                    cost_map_override=cost_map_override,
-                                    relaxed_clearance=True)
-        return result
+        return best_path if best_path is not None else fallback_path
 
     def frontier_path(self, start, end):
         if start is None or end is None:
-            return []
-        sx, sy = int(start[0]), int(start[1])
-        ex, ey = int(end[0]), int(end[1])
-        if not (0 <= sx < self.map_size and 0 <= sy < self.map_size and
-                0 <= ex < self.map_size and 0 <= ey < self.map_size):
             return []
         base = self.grid_map.copy().astype(np.float32)
         base[base == DEPTH_OBSTACLE] = OBSTACLE
@@ -585,8 +578,7 @@ class OccupancyGrid:
             utils.clear_around_point(tmp, end, inflation_pixels=ASTAR_EXPANSION_PIXELS)
         if not g_mask[int(start[1]), int(start[0])]:
             utils.clear_around_point(tmp, start, inflation_pixels=ASTAR_EXPANSION_PIXELS)
-        cost = self.cost_map.copy() if self.cost_map is not None else None
-        path = _astar(tmp, start, end, cost_map=cost)
+        path = _astar(tmp, start, end, cost_map=self.cost_map)
         if path and any(g_mask[int(py), int(px)] for px, py in path
                         if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
             return None

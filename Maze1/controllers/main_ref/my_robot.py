@@ -45,9 +45,15 @@ class MyRobot(Robot):
         self.blue_prev_estimate_position   = None
         self.yellow_prev_estimate_position = None
         self.estimation_distance_threshold = 0.5
-        self.last_found_color = None
-        self.last_found_point = None
-        self.first_found_color = None
+        # Colors that have been confirmed at close range (front-facing,
+        # < COLOR_DETECTION_DEPTH_THRESHOLD). A column can be provisionally
+        # committed (start_point/end_point set) from farther away so
+        # exploration/frontier logic can use it, but the approach target
+        # keeps being refreshed and the commit keeps being overwritten with
+        # fresher estimates until this confirmation lands -- otherwise the
+        # final pillar-to-pillar path gets planned to a stale, far-off mark
+        # that was never actually reached, which is what left it unreachable.
+        self._column_confirmed_close = set()
         # Floating-wall detection: height-band marking with confirmed,
         # frustum-gated persistence (see _refresh_map_depth). Every point
         # `_depth_obstacle_points_local` returns already lies inside the
@@ -62,6 +68,12 @@ class MyRobot(Robot):
         # clearing pass (_frustum_clear_floating), never by simple
         # per-frame reclassification.
         self._floating_votes = {}
+        # Closest forward distance (m) each candidate cell has ever been
+        # observed at, across frames -- lets a cell first glimpsed only up
+        # close qualify for the reduced FLOATING_WALL_CONFIRM_VOTES_CLOSE
+        # threshold (see _refresh_map_depth) instead of always needing the
+        # full FLOATING_WALL_CONFIRM_VOTES.
+        self._floating_best_range = {}
         self._floating_confirmed = set()
         # Contradiction counter for frustum-gated clearing: how many
         # distinct frames have shown the camera's own line of sight passing
@@ -553,8 +565,20 @@ class MyRobot(Robot):
             h, w = grid.shape
 
             veto_r = FLOATING_WALL_NEAR_LIDAR_VETO_CELLS
+            # Track the closest forward distance each candidate cell was
+            # observed at this frame -- a wall seen nearly edge-on (the
+            # "vertical" case) is very often visible to the depth camera
+            # only during a brief close-range window, sometimes just a
+            # frame or two, which may never reach FLOATING_WALL_CONFIRM_VOTES
+            # before the robot moves past it or the wall leaves the FOV.
+            # Close-range depth measurements also carry much less angular
+            # error than far ones (the same 1-pixel angular uncertainty
+            # translates to far less real-world position error up close),
+            # so trusting fewer independent close-range votes is not a
+            # noise-tolerance regression -- see FLOATING_WALL_CONFIRM_VOTES_CLOSE.
+            cell_min_forward = {}
             candidate_cells = set()
-            for mx, my in map_pts:
+            for (mx, my), forward in zip(map_pts, pts_local[:, 0]):
                 mx_i, my_i = int(mx), int(my)
                 if not (0 <= mx_i < w and 0 <= my_i < h):
                     continue
@@ -573,7 +597,11 @@ class MyRobot(Robot):
                 x0, x1 = max(0, mx_i - veto_r), min(w, mx_i + veto_r + 1)
                 if np.any(grid[y0:y1, x0:x1] == OBSTACLE):
                     continue
-                candidate_cells.add((mx_i, my_i))
+                cell = (mx_i, my_i)
+                candidate_cells.add(cell)
+                prev = cell_min_forward.get(cell)
+                if prev is None or forward < prev:
+                    cell_min_forward[cell] = float(forward)
 
             newly_confirmed = set()
             for cell in candidate_cells:
@@ -581,7 +609,13 @@ class MyRobot(Robot):
                     continue
                 votes = self._floating_votes.get(cell, 0) + 1
                 self._floating_votes[cell] = min(votes, FLOATING_WALL_VOTE_CAP)
-                if self._floating_votes[cell] >= FLOATING_WALL_CONFIRM_VOTES:
+                best_range = min(cell_min_forward[cell],
+                                  self._floating_best_range.get(cell, float('inf')))
+                self._floating_best_range[cell] = best_range
+                required = (FLOATING_WALL_CONFIRM_VOTES_CLOSE
+                            if best_range <= FLOATING_WALL_CLOSE_RANGE_M
+                            else FLOATING_WALL_CONFIRM_VOTES)
+                if self._floating_votes[cell] >= required:
                     newly_confirmed.add(cell)
 
             for cell in newly_confirmed:
@@ -589,6 +623,7 @@ class MyRobot(Robot):
                 self._floating_group[cell] = cell
                 self._floating_group_members[cell] = {cell}
                 self._floating_merge_touching(cell)
+                self._floating_merge_colinear_gap(cell)
                 self._floating_bridge_gap(cell)
                 self._floating_solidify_group(self._floating_find(cell))
 
@@ -617,6 +652,7 @@ class MyRobot(Robot):
             for cell in lidar_owned:
                 self._floating_confirmed.discard(cell)
                 self._floating_votes.pop(cell, None)
+                self._floating_best_range.pop(cell, None)
                 self._floating_clear_votes.pop(cell, None)
                 root = self._floating_find(cell)
                 members = self._floating_group_members.get(root)
@@ -699,6 +735,7 @@ class MyRobot(Robot):
                 members.discard(cell)
             self._floating_group.pop(cell, None)
             self._floating_votes.pop(cell, None)
+            self._floating_best_range.pop(cell, None)
             mx, my = cell
             if grid[my, mx] == DEPTH_OBSTACLE:
                 grid[my, mx] = FREESPACE
@@ -734,6 +771,66 @@ class MyRobot(Robot):
                 neighbor = (cx + dx, cy + dy)
                 if neighbor in self._floating_confirmed:
                     self._floating_union(cell, neighbor)
+
+    def _floating_merge_colinear_gap(self, cell):
+        """Close a coverage gap WITHIN one physical floating-wall panel:
+        its two visible ends got confirmed, but sampling/occlusion/a brief
+        viewing window never confirmed the cells between them, leaving a
+        hole the planner would happily route the robot through. Searches
+        only along the same row and the same column (never a general
+        radius) for another confirmed cell belonging to a different group
+        — restricting to the two cardinal directions means this can only
+        ever merge two points that are candidates for being the SAME
+        straight wall run, never an unrelated object that merely happens
+        to be nearby in some other direction. The search distance is
+        capped at FLOATING_WALL_GAP_CLOSE_MAX_CELLS (the robot's own
+        physical width), which is what makes closing it always safe: a
+        gap narrower than the robot itself could never have been a real,
+        driveable passage regardless of what's on either side of it."""
+        cx, cy = cell
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        root = self._floating_find(cell)
+        limit = FLOATING_WALL_GAP_CLOSE_MAX_CELLS
+
+        best_x, best_dx = None, None
+        for nx in range(max(0, cx - limit), min(w, cx + limit + 1)):
+            if nx == cx:
+                continue
+            target = (nx, cy)
+            if target in self._floating_confirmed and self._floating_find(target) != root:
+                d = abs(nx - cx)
+                if best_dx is None or d < best_dx:
+                    best_dx, best_x = d, nx
+        if best_x is not None:
+            for x in range(min(cx, best_x) + 1, max(cx, best_x)):
+                c2 = (x, cy)
+                if c2 not in self._floating_confirmed:
+                    self._floating_confirmed.add(c2)
+                    self._floating_group[c2] = c2
+                    self._floating_group_members[c2] = {c2}
+                    self._floating_union(c2, cell)
+            self._floating_union(cell, (best_x, cy))
+            root = self._floating_find(cell)
+
+        best_y, best_dy = None, None
+        for ny in range(max(0, cy - limit), min(h, cy + limit + 1)):
+            if ny == cy:
+                continue
+            target = (cx, ny)
+            if target in self._floating_confirmed and self._floating_find(target) != root:
+                d = abs(ny - cy)
+                if best_dy is None or d < best_dy:
+                    best_dy, best_y = d, ny
+        if best_y is not None:
+            for y in range(min(cy, best_y) + 1, max(cy, best_y)):
+                c2 = (cx, y)
+                if c2 not in self._floating_confirmed:
+                    self._floating_confirmed.add(c2)
+                    self._floating_group[c2] = c2
+                    self._floating_group_members[c2] = {c2}
+                    self._floating_union(c2, cell)
+            self._floating_union(cell, (cx, best_y))
 
     def _floating_bridge_gap(self, cell):
         """Close the space between a newly confirmed cell and whatever
@@ -845,6 +942,7 @@ class MyRobot(Robot):
                     self.occ_map.grid_map[my, mx] = FREESPACE
             cells.clear()
         self._floating_votes = {}
+        self._floating_best_range = {}
         self._floating_confirmed = set()
         self._floating_clear_votes = {}
         self._floating_group = {}
@@ -1276,10 +1374,6 @@ class MyRobot(Robot):
         lid_ok = self.get_lidar_front_min_dist(angle_range_deg=35) < 0.15
         return ds_ok or lid_ok
 
-    def there_is_obstacle(self, map_target):
-        return self.occ_map.cell_blocked(map_target)
-
-
     def _unknown_neighborhood_score(self, mx, my, radius=5):
         grid = self.grid_map
         h, w = grid.shape
@@ -1292,6 +1386,9 @@ class MyRobot(Robot):
         return float(np.count_nonzero(grid[y0:y1, x0:x1] == UNKNOWN)) / float(area)
 
     # ── DWA planner ───────────────────────────────────────────────────────────
+
+    def there_is_obstacle(self, map_target):
+        return self.occ_map.cell_blocked(map_target)
 
     def dwa_planner(self, world_target):
         best_score, best_v, best_w = -float('inf'), 0.0, 0.0
@@ -1590,6 +1687,7 @@ class MyRobot(Robot):
             if not self._column_commit_ready(color):
                 return False
             mp = (int(round(float(est[0]))), int(round(float(est[1]))))
+            close = self._column_close_front_visible(color)
         else:
             column_local = self._column_depth_position_local(color)
             if column_local is None:
@@ -1603,9 +1701,10 @@ class MyRobot(Robot):
                           [np.sin(heading),  np.cos(heading)]])
             wp = column_local[:2] @ R.T + np.array([self._odom_x, self._odom_y])
             mp = self.convert_to_map_coordinates(float(wp[0]), float(wp[1]))
+            close = column_local[0] * 100.0 < COLOR_DETECTION_DEPTH_THRESHOLD
         # Maze1 reference: commit the raw projected point. _refine_column_map_position
         # snapped the marker into the pillar's own OBSTACLE blob, which broke plotting.
-        self._set_committed_column(color, mp)
+        self._set_committed_column(color, mp, close=close)
         return True
 
     def mark_on_map(self, distance_cm, color='blue'):
@@ -1625,23 +1724,37 @@ class MyRobot(Robot):
             # would block the ray even though the camera has direct line of sight.
             if not self._column_is_front_facing(color) and not self._column_line_of_sight_clear(mp):
                 return False
-            self._set_committed_column(color, mp)
+            # This branch only fires when column_local[0] < COLOR_DETECTION_DEPTH_THRESHOLD,
+            # i.e. the pillar is already close -- always a confirmed-close commit.
+            self._set_committed_column(color, mp, close=True)
             return True
         return False
 
-    def _set_committed_column(self, color, mp):
+    def _set_committed_column(self, color, mp, close=False):
+        if close:
+            # Core fix: a depth-camera projection (heading rotation + camera
+            # offset + range) can land the "pillar" map cell inside a wall,
+            # an as-yet-UNKNOWN cell, or a region the map doesn't actually
+            # connect to the rest of explored space -- A* then has no route
+            # to it and the run reports "no path found" even though the
+            # pillar was clearly seen. The known-working reference
+            # (duchieuvn/autonomous2) sidesteps this entirely: once the robot
+            # is within COLOR_DETECTION_DEPTH_THRESHOLD of the column it
+            # commits its own current map cell, not a projected one. The
+            # robot is physically standing there, so the cell is guaranteed
+            # FREESPACE and reachable -- which is exactly what the final
+            # pillar-to-pillar planner needs as an endpoint.
+            mp = tuple(self.get_map_position())
         self._commit_column_cell(color, mp)
         if color == 'blue':
             self.start_point = mp
         elif color == 'yellow':
             self.end_point = mp
-        if self.first_found_color is None:
-            self.first_found_color = color
-        if self._column_focus_color == color:
-            self._column_focus_color = None
-            self._column_focus_target = None
-        self.last_found_color = color
-        self.last_found_point = mp
+        if close:
+            self._column_confirmed_close.add(color)
+            if self._column_focus_color == color:
+                self._column_focus_color = None
+                self._column_focus_target = None
 
     def _column_is_committed(self, color):
         return self.start_point is not None if color == 'blue' else self.end_point is not None
@@ -1672,7 +1785,8 @@ class MyRobot(Robot):
         if est is None:
             return False
         mp = (int(round(float(est[0]))), int(round(float(est[1]))))
-        self._set_committed_column(color, mp)
+        close = force or self._column_close_front_visible(color)
+        self._set_committed_column(color, mp, close=close)
         return True
 
     def update_column_estimation(self, color, position):
@@ -1796,8 +1910,12 @@ class MyRobot(Robot):
         if est is not None:
             self._commit_column_cell(color, (int(round(float(est[0]))),
                                             int(round(float(est[1])))))
-            if ((color == 'blue' and self.start_point is None) or
-                    (color == 'yellow' and self.end_point is None)):
+            # Keep steering toward the pillar (refreshing the approach target
+            # with each fresher estimate) until it has actually been
+            # confirmed at close range -- a provisional far commit alone
+            # must not stop the approach, or the final stamped position can
+            # be left far from the real pillar.
+            if color not in self._column_confirmed_close:
                 self._column_focus_color = color
                 self._column_focus_target = self._column_approach_target(est)
         if color == 'blue':
@@ -1808,7 +1926,7 @@ class MyRobot(Robot):
 
     # ── Dynamic path validation and replanning helpers ─────────────────────────
 
-    def _path_blocked(self, path, lookahead=12, cost_thresh=0.82):
+    def _path_blocked(self, path, lookahead=PATH_BLOCKED_LOOKAHEAD_CELLS, cost_thresh=0.82):
         """Return True if any of the next `lookahead` path cells are blocked or
         have high cost near walls. Also consider persistent depth-only obstacles
         that may not yet be reflected in the grid_map."""
@@ -1833,7 +1951,7 @@ class MyRobot(Robot):
                     pass
         return False
 
-    def _path_blocked_from_pose(self, path, lookahead=12, cost_thresh=0.82):
+    def _path_blocked_from_pose(self, path, lookahead=PATH_BLOCKED_LOOKAHEAD_CELLS, cost_thresh=0.82):
         """Check path blocking starting from the closest waypoint to the robot."""
         if path is None or len(path) == 0:
             return False
@@ -1881,7 +1999,7 @@ class MyRobot(Robot):
             pass
         return None
 
-    def _path_usable_from_pose(self, path, min_len=3, lookahead=14):
+    def _path_usable_from_pose(self, path, min_len=3, lookahead=PATH_USABLE_LOOKAHEAD_CELLS):
         if not path or len(path) < min_len:
             return False
         grid = self.occ_map.grid_map
@@ -1891,13 +2009,16 @@ class MyRobot(Robot):
                 return False
         return not self._path_blocked_from_pose(path, lookahead=lookahead, cost_thresh=0.82)
 
-    def _final_path_clear(self, path, endpoint_margin=2):
+    def _final_path_clear(self, path, endpoint_margin=2, blocked_values=None,
+                           use_live_depth_cells=True):
         if not path or len(path) < 2:
             return False
         grid = self.occ_map.grid_map
         h, w = grid.shape
-        blocked_values = (OBSTACLE, DEPTH_OBSTACLE, CLOSED, GREEN_CARPET)
-        depth_cells = getattr(self.occ_map, '_depth_obstacle_cells', set())
+        if blocked_values is None:
+            blocked_values = (OBSTACLE, DEPTH_OBSTACLE, CLOSED, GREEN_CARPET)
+        depth_cells = (getattr(self.occ_map, '_depth_obstacle_cells', set())
+                       if use_live_depth_cells else ())
         for i in range(1, len(path)):
             x0, y0 = int(path[i - 1][0]), int(path[i - 1][1])
             x1, y1 = int(path[i][0]), int(path[i][1])
@@ -1918,6 +2039,22 @@ class MyRobot(Robot):
             return False
         return self._final_path_clear(path)
 
+    def _final_path_hard_clear(self, path, min_len=3):
+        """Non-negotiable check: does the path's ray-cast actually cross a
+        confirmed solid obstacle (real LiDAR wall, a closure mark, or the
+        green-carpet no-go zone)? Unlike _final_path_usable() this ignores
+        DEPTH_OBSTACLE / the live _depth_obstacle_cells set -- those are
+        floating-wall *candidates* that can be transient/stale, so failing
+        only on them is treated as a soft rejection elsewhere. Failing this
+        check means the path geometrically overlaps a real wall and must
+        never be driven, regardless of which inflation/clearance tier
+        produced it."""
+        if not path or len(path) < min_len:
+            return False
+        return self._final_path_clear(
+            path, blocked_values=(OBSTACLE, CLOSED, GREEN_CARPET),
+            use_live_depth_cells=False)
+
     def _final_pillar_access_cell(self, pillar, prefer=None, min_radius=4, max_radius=18):
         if pillar is None:
             return None
@@ -1925,6 +2062,14 @@ class MyRobot(Robot):
         h, w = grid.shape
         px, py = int(round(float(pillar[0]))), int(round(float(pillar[1])))
         pref = np.array(prefer if prefer is not None else self.get_map_position(), dtype=float)
+        # A close-confirmed pillar cell (see _set_committed_column) IS the
+        # robot's own previously-visited map position, so it is already
+        # guaranteed FREESPACE and reachable -- use it directly instead of
+        # searching outward from min_radius, which would otherwise skip the
+        # one cell already proven good.
+        if (0 <= px < w and 0 <= py < h and grid[py, px] == FREESPACE and
+                not self.occ_map.cell_blocked((px, py))):
+            return (px, py)
         best, best_score = None, float('inf')
         for radius in range(min_radius, max_radius + 1):
             found_at_radius = False
@@ -2006,6 +2151,15 @@ class MyRobot(Robot):
 
     def scan_360(self):
         print('[Scan] 360° rotation...')
+        # scan_360 is a pure in-place spin — the robot ends up at the same
+        # (x, y) it started at. Wheel/ground contact keeps the two encoders
+        # from cancelling out exactly, so over hundreds of steps of continuous
+        # rotation _tick_odometry's ds accumulates real position drift, which
+        # then throws off pillar projection right after the scan. Snapshot the
+        # pre-scan position and restore it afterwards — heading still comes
+        # straight from the compass each tick, so this only discards the
+        # spurious translational drift, not real orientation changes.
+        origin_x, origin_y = self._odom_x, self._odom_y
         self.set_robot_velocity(3.0, -3.0)
         steps_done  = 0
         target_steps = 8500 // self.time_step
@@ -2026,6 +2180,7 @@ class MyRobot(Robot):
                     found_sig = sig
                     break
         self.stop_motor()
+        self._odom_x, self._odom_y = origin_x, origin_y
         return found_sig
 
     def _suspend_column_focus(self, color, seconds=8.0):
@@ -2367,7 +2522,7 @@ class MyRobot(Robot):
         live map and replan immediately (same goal) when a segment is blocked."""
         while self._rt_planner_running:
             try:
-                time.sleep(0.15)
+                time.sleep(0.08)
                 with self._rt_planner_lock:
                     goal          = self._rt_planner_goal
                     cur           = self._rt_active_path
@@ -2382,7 +2537,7 @@ class MyRobot(Robot):
                 if path_clear:
                     continue
                 now = time.time()
-                if now - self._rt_last_replan_time < 1.0:
+                if now - self._rt_last_replan_time < 0.6:
                     continue
                 self._rt_last_replan_time = now
                 new = self._attempt_replan(goal)
@@ -2711,12 +2866,18 @@ class MyRobot(Robot):
     # ── Final path following ──────────────────────────────────────────────────
 
     def follow_final_path(self, path, debug_vis=False, replan_interval=60):
+        """Pillar-to-pillar final approach: both columns are already found
+        and committed by the time this runs, so there is nothing left to
+        detect or scan for -- this is pure path following plus obstacle-
+        triggered replanning. The camera thread (column/green-carpet
+        detection, including its stop-and-recenter-on-a-column behaviour)
+        is deliberately NOT restarted here; the LiDAR thread stays running
+        since the occupancy grid still needs live updates for the
+        obstacle-based realtime replanning below."""
         if not path:
             print('[FinalPath] Empty path')
             return False
 
-        if not self.camera_thread_running:
-            self.start_camera_thread()
         if not self.lidar_thread_running:
             self.start_lidar_thread()
         if debug_vis:
@@ -2742,12 +2903,20 @@ class MyRobot(Robot):
 
         # Reference-style final follow, but preserve the final pillar-to-pillar
         # route produced by explore() instead of replacing it at startup.
+        # _final_path_usable() ray-casts every path segment against the grid,
+        # which can be tripped up by noisy/transient DEPTH_OBSTACLE cells near
+        # the pillars themselves; treat it as a preference, not a hard gate --
+        # a nominally "unusable" path is still driven, with in-loop obstacle
+        # detection and replanning (below) handling any real blockage as the
+        # robot actually reaches it, same as the known-working reference.
         cur_path = list(path)
         if not self._final_path_usable(cur_path):
-            cur_path = _plan_from_current()
-            if not self._final_path_usable(cur_path):
-                print('[FinalPath] No wall-clear path available')
-                return False
+            replanned = _plan_from_current()
+            if replanned:
+                cur_path = replanned
+        if not cur_path:
+            print('[FinalPath] No path available')
+            return False
 
         with self.occ_map.vis_lock:
             rx, ry = self.get_map_position()
@@ -2785,163 +2954,140 @@ class MyRobot(Robot):
         last_replan_tick = 0
         map_wait_steps = 40
 
-        self.start_realtime_planner(goal)
-        self.update_realtime_path(cur_path)
-        try:
-            while i < len(waypoints):
-                target = waypoints[i]
-                while self.step(self.time_step) != -1:
-                    tick += 1
+        while i < len(waypoints):
+            target = waypoints[i]
+            while self.step(self.time_step) != -1:
+                tick += 1
 
-                    rt = self.poll_realtime_planner()
-                    if rt and self._final_path_usable(rt):
-                        cur_path = list(rt)
-                        self.update_realtime_path(cur_path)
+                if self.obstacle_in_front():
+                    new = self._recover_and_replan(goal, prefer_frontier=False, min_len=3)
+                    if self._final_path_usable(new):
+                        cur_path = list(new)
                         waypoints = _build_waypoints(cur_path)
                         i = -1
-                        with self.occ_map.vis_lock:
-                            self.occ_map.current_path = cur_path
-                        print('[RT-Planner] Path swapped in follow_final_path')
+                        last_replan_tick = tick
                         break
-
-                    sig = None
-                    with self.detection_lock:
-                        sig = self._pop_detection_signal()
-
-                    if sig == 'green_carpet':
-                        self.mark_green_carpet_permanently(min_pixel_threshold=1500, force=True)
-
-                    if isinstance(sig, tuple) and len(sig) >= 2 and sig[0] == 'column':
-                        _, color = sig
-                        try:
-                            ratio = self.get_column_center_ratio(color)
-                            d     = self.estimate_column_distance(color)
-                            close = (d is not None and d < COLOR_DETECTION_DEPTH_THRESHOLD)
-                            if close:
-                                self.stop_motor()
-                                for _ in range(10):
-                                    if not self.is_turning(): break
-                                    if self.step(self.time_step) == -1: break
-                                found = self._estimate_column_pos(color)
-                                if not found:
-                                    self.center_column_in_view(color)
-                                    found = self._estimate_column_pos(color)
-                                dist = self.estimate_column_distance(color)
-                                if dist is not None:
-                                    self.mark_on_map(dist, color=color)
-                                if found and not self._column_is_committed(color):
-                                    self.mark_column(color)
-                                if found and not self._column_is_committed(color):
-                                    self._commit_column_from_estimate(color)
-                        except Exception:
-                            pass
-
-                    if tick % 5 == 0:
-                        try:
-                            if self.detect_green():
-                                self.mark_green_carpet_permanently(min_pixel_threshold=2500, force=True)
-                        except Exception:
-                            pass
-
-                    if self.obstacle_in_front():
-                        new = self._recover_and_replan(goal, prefer_frontier=False, min_len=3)
-                        if self._final_path_usable(new):
-                            cur_path = list(new)
-                            self.update_realtime_path(cur_path)
-                            waypoints = _build_waypoints(cur_path)
-                            i = -1
-                            last_replan_tick = tick
-                            break
-                        for _ in range(map_wait_steps):
-                            if self.step(self.time_step) == -1:
-                                self.stop_motor()
-                                return False
-                        new = _plan_from_current()
-                        if self._final_path_usable(new):
-                            cur_path = list(new)
-                            self.update_realtime_path(cur_path)
-                            waypoints = _build_waypoints(cur_path)
-                            i = -1
-                            last_replan_tick = tick
-                            break
-                        print('[FinalPath] Replan failed after obstacle; continuing supplied path')
-
-                    try:
-                        blocked = self._path_blocked_from_pose(cur_path, lookahead=24)
-                        interval_hit = bool(replan_interval) and (tick - last_replan_tick >= replan_interval)
-                        if blocked or (interval_hit and not self._path_usable_from_pose(cur_path, min_len=3, lookahead=24)):
-                            new = self._attempt_replan(goal)
-                            if self._final_path_usable(new):
-                                cur_path = list(new)
-                                self.update_realtime_path(cur_path)
-                                waypoints = _build_waypoints(cur_path)
-                                i = -1
-                                last_replan_tick = tick
-                                break
-                            new = _plan_from_current()
-                            if self._final_path_usable(new):
-                                cur_path = list(new)
-                                self.update_realtime_path(cur_path)
-                                waypoints = _build_waypoints(cur_path)
-                                i = -1
-                                last_replan_tick = tick
-                                break
-                            last_replan_tick = tick
-                    except Exception:
-                        pass
-
-                    with self.occ_map.vis_lock:
-                        rx, ry = self.get_map_position()
-                        self.occ_map.robot_position  = (int(rx), int(ry))
-                        self.occ_map.current_path    = cur_path
-                        self.occ_map.target_position = target
-                    self.occ_map.refresh_viz()
-
-                    reached, is_stuck = self.advance_to_waypoint(target)
-                    if is_stuck or (len(self.get_distances()) and
-                                    min(self.get_distances()) < 0.05):
-                        self.stop_motor()
-                        new = self._recover_and_replan(goal, prefer_frontier=False, min_len=3)
-                        if self._final_path_usable(new):
-                            cur_path  = list(new)
-                            self.update_realtime_path(cur_path)
-                            waypoints = _build_waypoints(cur_path)
-                            i = -1
-                            last_replan_tick = tick
-                            break
-                        for _ in range(map_wait_steps):
-                            if self.step(self.time_step) == -1:
-                                self.stop_motor()
-                                return False
-                        new = _plan_from_current()
-                        if self._final_path_usable(new):
-                            cur_path  = list(new)
-                            self.update_realtime_path(cur_path)
-                            waypoints = _build_waypoints(cur_path)
-                            i = -1
-                            last_replan_tick = tick
-                            break
-                        print(f'[FinalPath] Recovery: skipping waypoint {i}, continuing')
-                        break
-
-                    if reached:
-                        if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                    for _ in range(map_wait_steps):
+                        if self.step(self.time_step) == -1:
                             self.stop_motor()
-                            print('[FinalPath] Goal reached')
-                            return True
+                            return False
+                    new = _plan_from_current()
+                    if self._final_path_usable(new):
+                        cur_path = list(new)
+                        waypoints = _build_waypoints(cur_path)
+                        i = -1
+                        last_replan_tick = tick
                         break
-                i += 1
-                if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                    print('[FinalPath] Replan failed after obstacle; continuing supplied path')
+
+                try:
+                    blocked = self._path_blocked_from_pose(cur_path, lookahead=FINAL_PATH_LOOKAHEAD_CELLS)
+                    interval_hit = bool(replan_interval) and (tick - last_replan_tick >= replan_interval)
+                    if blocked or (interval_hit and not self._path_usable_from_pose(cur_path, min_len=3, lookahead=FINAL_PATH_LOOKAHEAD_CELLS)):
+                        new = self._attempt_replan(goal)
+                        if self._final_path_usable(new):
+                            cur_path = list(new)
+                            waypoints = _build_waypoints(cur_path)
+                            i = -1
+                            last_replan_tick = tick
+                            break
+                        new = _plan_from_current()
+                        if self._final_path_usable(new):
+                            cur_path = list(new)
+                            waypoints = _build_waypoints(cur_path)
+                            i = -1
+                            last_replan_tick = tick
+                            break
+                        last_replan_tick = tick
+                except Exception:
+                    pass
+
+                with self.occ_map.vis_lock:
+                    rx, ry = self.get_map_position()
+                    self.occ_map.robot_position  = (int(rx), int(ry))
+                    self.occ_map.current_path    = cur_path
+                    self.occ_map.target_position = target
+                self.occ_map.refresh_viz()
+
+                reached, is_stuck = self.advance_to_waypoint(target)
+                if is_stuck or (len(self.get_distances()) and
+                                min(self.get_distances()) < 0.05):
                     self.stop_motor()
-                    print('[FinalPath] Goal reached (post-check)')
-                    return True
-        finally:
-            self.stop_realtime_planner()
+                    new = self._recover_and_replan(goal, prefer_frontier=False, min_len=3)
+                    if self._final_path_usable(new):
+                        cur_path  = list(new)
+                        waypoints = _build_waypoints(cur_path)
+                        i = -1
+                        last_replan_tick = tick
+                        break
+                    for _ in range(map_wait_steps):
+                        if self.step(self.time_step) == -1:
+                            self.stop_motor()
+                            return False
+                    new = _plan_from_current()
+                    if self._final_path_usable(new):
+                        cur_path  = list(new)
+                        waypoints = _build_waypoints(cur_path)
+                        i = -1
+                        last_replan_tick = tick
+                        break
+                    print(f'[FinalPath] Recovery: skipping waypoint {i}, continuing')
+                    break
+
+                if reached:
+                    if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                        self.stop_motor()
+                        print('[FinalPath] Goal reached')
+                        return True
+                    break
+            i += 1
+            if self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE:
+                self.stop_motor()
+                print('[FinalPath] Goal reached (post-check)')
+                return True
 
         self.stop_motor()
         success = self.get_map_distance(goal) < PATH_FOLLOWING_TARGET_REACH_DISTANCE
         print(f'[FinalPath] Finished, success={success}')
         return success
+
+    def _confirm_pillar_close(self, color, max_attempts=4):
+        """Drive toward the current best estimate of `color`'s pillar until a
+        close-range, front-facing confirmation lands (mark_on_map's
+        < COLOR_DETECTION_DEPTH_THRESHOLD branch), refining/overwriting the
+        committed position each attempt. Bounded by max_attempts so a pillar
+        boxed in by obstacles can't stall the run forever -- if it never
+        confirms, the best (possibly still-far) position found so far is
+        kept and used as-is for the final path."""
+        if color in self._column_confirmed_close:
+            return True
+        for _ in range(max_attempts):
+            est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
+            if est is None:
+                return False
+            ex, ey = int(round(float(est[0]))), int(round(float(est[1])))
+            target = self._column_approach_target(est, min_radius=3, max_radius=10)
+            if target is None:
+                target = self._final_pillar_access_cell(
+                    (ex, ey), prefer=self.get_map_position(),
+                    min_radius=3, max_radius=10)
+            if target is None:
+                return False
+            start = self.get_map_position()
+            path = self.occ_map.astar_path(start, target, inflation_levels=[2, 1, 0])
+            if path and len(path) > 1:
+                self.navigate_frontier(path)
+            self.center_column_in_view(color)
+            found = self._estimate_column_pos(color)
+            if not found:
+                found = (self.get_column_center_pixels(color) >= 4 and
+                          self._estimate_column_pos(color))
+            dist = self.estimate_column_distance(color)
+            if dist is not None:
+                self.mark_on_map(dist, color=color)
+            if color in self._column_confirmed_close:
+                return True
+        return color in self._column_confirmed_close
 
     # ── Main exploration loop ─────────────────────────────────────────────────
 
@@ -3048,6 +3194,16 @@ class MyRobot(Robot):
 
             count += 1
 
+        # found_all_2_columns() only requires a provisional commit (which can
+        # happen from up to COLUMN_COMMIT_MAX_DISTANCE_CM away), so it can end
+        # the loop above before the robot ever actually got close to either
+        # pillar. Use the camera/lidar threads one last time, while they're
+        # still running, to drive in and get a close-range confirmation for
+        # each pillar before the final path is planned from these positions.
+        if self.found_all_2_columns():
+            for color in ('blue', 'yellow'):
+                self._confirm_pillar_close(color)
+
         self.stop_camera_thread()
         self.stop_lidar_thread()
         self.occ_map.stop_viz()
@@ -3063,14 +3219,10 @@ class MyRobot(Robot):
         if self.start_point is not None and self.end_point is not None:
             blue   = tuple(self.start_point)
             yellow = tuple(self.end_point)
-            # Plan the final path pillar-to-pillar with A*, not from the robot's
-            # current pose. Start at the latest detected pillar, then go to the
-            # other one.
-            route_start_color = self.last_found_color or self.first_found_color
-            if route_start_color == 'yellow':
-                start_pillar, end_pillar = yellow, blue
-            else:
-                start_pillar, end_pillar = blue, yellow
+            # Plan the final path pillar-to-pillar with A*, not from the
+            # robot's current pose. Always blue -> yellow, regardless of
+            # which one was physically discovered first during exploration.
+            start_pillar, end_pillar = blue, yellow
             start_access = self._final_pillar_access_cell(
                 start_pillar, prefer=self.get_map_position())
             end_access = self._final_pillar_access_cell(
@@ -3079,22 +3231,129 @@ class MyRobot(Robot):
                 print('[Explore] WARNING: both pillars found but no free access '
                       'cell exists near a pillar.')
                 return []
-            # Both pillars are known, but final execution must not accept a route
-            # that crosses real obstacle cells. Try thinner inflation if needed,
-            # then validate the returned cells against the current map.
-            path = self.find_path(start_access, end_access)
-            if not self._final_path_usable(path):
-                path = self.occ_map.astar_path(
-                    start_access, end_access, inflation_levels=[2, 1, 0])
-            if not self._final_path_usable(path):
-                path = None
+            path = self._plan_final_pillar_path(start_access, end_access)
+            if not path:
+                # astar_path only ever traverses cells already confirmed
+                # FREESPACE -- UNKNOWN cells are treated as blocked by design
+                # (astar_2_spline.py checks `grid == 0`, and UNKNOWN == 255).
+                # The main loop above stops exploring the instant both
+                # pillars are found, which can be well before the region
+                # between them has ever actually been mapped -- so "no
+                # route" here can mean the route is genuinely absent from
+                # the known map yet, not that planning failed. Resume
+                # exploration, bounded, to bridge the gap and retry instead
+                # of giving up on the first attempt.
+                path = self._bridge_explore_and_replan(start_access, end_access, debug=debug)
             if path:
                 print(f'[Explore] Final pillar-to-pillar path: {len(path)} waypoints')
             else:
-                print('[Explore] WARNING: both pillars found but planner returned '
-                      'no wall-clear path.')
+                print('[Explore] WARNING: both pillars found but planner found no '
+                      'route at all — pillars are unreachable on the current map.')
             return path or []
         return []
+
+    def _bridge_explore_and_replan(self, start_access, end_access, debug=False,
+                                    max_iters=400, retry_every=20):
+        """Resume ordinary frontier exploration (same machinery as explore()'s
+        main loop) to grow map connectivity between the two already-found
+        pillars, retrying the final plan every `retry_every` iterations, up
+        to `max_iters`. Bounded so an actually-unreachable pair of pillars
+        (e.g. separated by a wall with no corridor) still terminates."""
+        if not self.camera_thread_running:
+            self.start_camera_thread()
+        if not self.lidar_thread_running:
+            self.start_lidar_thread()
+        if debug:
+            try:
+                self.occ_map.start_viz()
+            except Exception:
+                pass
+        print('[Explore] Final route not yet connected — resuming exploration '
+              'to bridge the gap...')
+        prev_grid = self.occ_map.grid_map.copy()
+        path = None
+        count = 0
+        while count < max_iters and self.step(self.time_step) != -1:
+            map_diff = utils.map_delta_ratio(prev_grid, self.occ_map.grid_map)
+            _, chosen, path_to_chosen, _ = self._update_frontier(count, map_diff)
+            if path_to_chosen:
+                self.navigate_frontier(path_to_chosen)
+            prev_grid = self.occ_map.grid_map.copy()
+            count += 1
+            if count % retry_every == 0:
+                path = self._plan_final_pillar_path(start_access, end_access)
+                if path:
+                    break
+        if not path:
+            path = self._plan_final_pillar_path(start_access, end_access)
+        self.stop_camera_thread()
+        self.stop_lidar_thread()
+        if debug:
+            self.occ_map.stop_viz()
+        self.stop_motor()
+        return path
+
+    def _plan_final_pillar_path(self, start_access, end_access):
+        """Tiered final-path planner for the pillar-to-pillar route.
+
+        astar_path() already bakes DEPTH_OBSTACLE into OBSTACLE and inflates
+        around OBSTACLE/CLOSED/GREEN_CARPET before searching. Its 2-cell-step
+        A* only validates the *destination* cell of each move, not the cells
+        it steps over, so a diagonal move at 0 inflation/clearance can cut
+        the corner of a real wall without that wall cell ever being visited
+        by the search. _final_path_hard_clear() ray-casts every path segment
+        cell-by-cell against the confirmed-solid values (OBSTACLE/CLOSED/
+        GREEN_CARPET only) and is the one check that is never bypassed --
+        any candidate that fails it is discarded outright, no matter which
+        tier produced it.
+
+        _final_path_usable() is stricter still (it also treats DEPTH_OBSTACLE
+        and the *live* _depth_obstacle_cells set as blocking); that set is
+        written by the camera/lidar threads and can change between planning
+        and this re-check, so a transient floating-wall vote can make a
+        perfectly good path look "blocked" a moment later. Among hard-clear
+        candidates, prefer one that also passes this stricter check, but
+        fall back to the shortest hard-clear candidate rather than
+        discarding a real path over a possibly-stale floating-wall vote --
+        follow_final_path() handles genuine obstacles live as the robot
+        actually reaches them.
+
+        astar_path()'s post-search clearance re-check (ASTAR_MIN_CLEARANCE_PIXELS,
+        10cm by default) is applied on top of whatever inflation level is
+        passed in, and is the same for every level -- so looser
+        inflation_levels alone can never open up a route that's simply
+        narrower than 10cm of clearance, which is entirely plausible right
+        next to a physical pillar. Progressively relax min_clearance_pixels
+        too, down to 0 (no post-search clearance requirement, only the raw
+        inflated-obstacle grid) -- the hard-clear check above is what keeps
+        that final, tightest tier from ever returning a wall-crossing path.
+        """
+        candidates = []
+
+        default_path = self.find_path(start_access, end_access)
+        if default_path and len(default_path) > 1:
+            candidates.append(default_path)
+
+        for inflation_levels, clearance in (
+            ([2, 1, 0], 3),
+            ([1, 0], 1),
+            ([0], 0),
+        ):
+            loose_path = self.occ_map.astar_path(
+                start_access, end_access, inflation_levels=inflation_levels,
+                min_clearance_pixels=clearance)
+            if loose_path and len(loose_path) > 1:
+                candidates.append(loose_path)
+                break
+
+        candidates = [c for c in candidates if self._final_path_hard_clear(c)]
+        if not candidates:
+            return None
+
+        for cand in candidates:
+            if self._final_path_usable(cand):
+                return cand
+        return min(candidates, key=len)
 
     def find_path(self, start, end):
         return self.occ_map.astar_path(start, end)

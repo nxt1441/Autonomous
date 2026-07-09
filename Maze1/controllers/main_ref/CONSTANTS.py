@@ -23,7 +23,7 @@ INITIAL_THETA =  0.0
 # cell count of 800 (500² vs 800² ≈ 2.56x fewer cells to touch every frame).
 # MAP_RENDER_SCALE below handles the on-screen viewing size independently,
 # so the displayed map doesn't look small just because the grid is lighter.
-MAP_PHYSICAL_SIZE_M = 12.0
+MAP_PHYSICAL_SIZE_M = 10
 MAP_SIZE        = 500               # cells
 RESOLUTION      = MAP_PHYSICAL_SIZE_M / MAP_SIZE
 INITIAL_LOG_ODD = 1.0
@@ -38,16 +38,27 @@ GREEN_CARPET    = 190
 
 # ── A* planner ───────────────────────────────────────────────────────────────
 PATH_MIN_LENGTH_M          = 0.8
+# The robot cannot physically fit through a gap narrower than its own
+# body, no matter how many inflation levels the planner falls back
+# through. Half of AXLE_LENGTH (wheel-to-wheel) plus a small margin for
+# wheel/chassis width is the real minimum clearance needed from centreline
+# to a wall on either side; every inflation level -- including the most
+# relaxed last-resort one -- must stay at or above this floor, or the
+# "last resort" fallback can hand back a path through a space the robot
+# genuinely cannot drive through.
+ROBOT_MIN_CLEARANCE_M = AXLE_LENGTH / 2.0 + 0.02
 # Inflation/clearance distances expressed in metres, then converted to
 # cells for the current RESOLUTION -- so changing MAP_SIZE/RESOLUTION can
 # never silently loosen or tighten the robot's real-world safety margin
-# the way a fixed cell count would. Metre values preserved from this
-# maze's previously tuned cell counts (4/3/2 cells at ~3.33 cm/cell).
-ASTAR_INFLATION_LEVELS_M   = [0.1333, 0.10, 0.0667]
+# the way a fixed cell count would. Levels progressively relax from a
+# generous safety margin down to (but never below) ROBOT_MIN_CLEARANCE_M.
+ASTAR_INFLATION_LEVELS_M   = [max(0.20, ROBOT_MIN_CLEARANCE_M + 0.07),
+                              max(0.16, ROBOT_MIN_CLEARANCE_M + 0.03),
+                              ROBOT_MIN_CLEARANCE_M]
 ASTAR_INFLATION_LEVELS     = [max(1, round(m / RESOLUTION)) for m in ASTAR_INFLATION_LEVELS_M]
 ASTAR_EXPANSION_M          = 0.10
 ASTAR_EXPANSION_PIXELS     = max(1, round(ASTAR_EXPANSION_M / RESOLUTION))
-ASTAR_FRONTIER_INFLATION_M = 0.1333
+ASTAR_FRONTIER_INFLATION_M = max(0.1333, ROBOT_MIN_CLEARANCE_M)
 ASTAR_FRONTIER_INFLATION   = max(1, round(ASTAR_FRONTIER_INFLATION_M / RESOLUTION))
 ASTAR_MIN_CLEARANCE_M      = 0.10
 ASTAR_MIN_CLEARANCE_PIXELS = max(1, round(ASTAR_MIN_CLEARANCE_M / RESOLUTION))
@@ -112,6 +123,24 @@ GREEN_CARPET_CONFIRM_MIN_POINTS_RATIO = 0.35
 FRONTIER_RENDER_MIN_AREA_M2 = 18 * (10.0 / 300) ** 2
 FRONTIER_RENDER_MIN_CELLS = max(1, round(FRONTIER_RENDER_MIN_AREA_M2 / (RESOLUTION ** 2)))
 MAP_RENDER_FPS = 30
+
+# ── Realtime obstacle-replan lookahead ───────────────────────────────────────
+# Frontier target scoring (_frontier_info_gain, _score_frontier, etc.) and
+# navigate_frontier/the realtime-planner watchdog now use the exact literal
+# cell counts from the reference implementation directly, not constants
+# derived here. The lookahead distances below are still expressed in
+# metres and converted via RESOLUTION, since they remain in active use by
+# _path_blocked/_path_blocked_from_pose/_path_usable_from_pose's own
+# default parameters and by follow_final_path.
+_FRONTIER_TUNING_BASIS_RES = 10.0 / 300
+PATH_BLOCKED_LOOKAHEAD_M = 12 * _FRONTIER_TUNING_BASIS_RES
+PATH_BLOCKED_LOOKAHEAD_CELLS = max(1, round(PATH_BLOCKED_LOOKAHEAD_M / RESOLUTION))
+PATH_USABLE_LOOKAHEAD_M = 14 * _FRONTIER_TUNING_BASIS_RES
+PATH_USABLE_LOOKAHEAD_CELLS = max(1, round(PATH_USABLE_LOOKAHEAD_M / RESOLUTION))
+# Used by follow_final_path's own blocked/usable checks on the pillar-to-
+# pillar final path.
+FINAL_PATH_LOOKAHEAD_M = 24 * _FRONTIER_TUNING_BASIS_RES
+FINAL_PATH_LOOKAHEAD_CELLS = max(1, round(FINAL_PATH_LOOKAHEAD_M / RESOLUTION))
 
 # ── Sensor ───────────────────────────────────────────────────────────────────
 # The Astra depth camera (Astra.proto, RangeFinder node) has a hard
@@ -206,6 +235,17 @@ FLOATING_WALL_NEAR_LIDAR_VETO_CELLS = max(1, round(FLOATING_WALL_NEAR_LIDAR_VETO
 # threshold it is a candidate only and is never drawn or blocked on — this
 # is what filters out one-off sensor noise instead of a shape/size heuristic.
 FLOATING_WALL_CONFIRM_VOTES = 4
+# A wall seen nearly edge-on (a "vertical" wall the robot mostly passes
+# alongside rather than faces) is often only visible to the depth camera
+# for a brief, close-range window -- sometimes too few frames to reach
+# FLOATING_WALL_CONFIRM_VOTES before the robot moves past it or the wall
+# leaves the FOV. Depth measurements taken this close also carry much less
+# angular/position error than far ones (the same per-pixel angular
+# uncertainty maps to far less real-world distance error up close), so
+# trusting fewer independent votes for a cell first seen this close is a
+# reduction in required SAMPLE COUNT, not in required CONFIDENCE.
+FLOATING_WALL_CLOSE_RANGE_M = 1.2
+FLOATING_WALL_CONFIRM_VOTES_CLOSE = 2
 # Vote counter ceiling per cell (just prevents unbounded growth; irrelevant
 # once a cell has already crossed FLOATING_WALL_CONFIRM_VOTES).
 FLOATING_WALL_VOTE_CAP = 8
@@ -218,6 +258,20 @@ FLOATING_WALL_VOTE_CAP = 8
 # gap, not a real passage, and A* would otherwise route straight through it.
 FLOATING_WALL_BRIDGE_RADIUS_M = 0.10
 FLOATING_WALL_BRIDGE_RADIUS_CELLS = max(1, round(FLOATING_WALL_BRIDGE_RADIUS_M / RESOLUTION))
+# A coverage gap WITHIN one physical floating-wall panel (its two visible
+# ends got confirmed, but sampling/occlusion/a brief viewing window never
+# confirmed the cells between them) can be much wider than the seam-bridge
+# radius above, which is deliberately kept small so it can never close off
+# an actually-usable opening. This second, larger threshold is still
+# provably safe to close unconditionally: it is capped at the robot's own
+# physical width, so a gap narrower than this could never have been a
+# real, driveable passage regardless -- the robot could not fit through it
+# either way. Applied only along the same row or column (never a general
+# radius), so it can only ever merge two points that are candidates for
+# being the SAME straight wall run, not an unrelated object that merely
+# happens to be nearby in some other direction.
+FLOATING_WALL_GAP_CLOSE_MAX_M = AXLE_LENGTH + 0.05
+FLOATING_WALL_GAP_CLOSE_MAX_CELLS = max(1, round(FLOATING_WALL_GAP_CLOSE_MAX_M / RESOLUTION))
 # Once two cells of the SAME already-established wall group are confirmed,
 # the straight run between them (per row/column) is filled in immediately —
 # see MyRobot._floating_solidify_group. Capped to this many cells (~1.5 m at
