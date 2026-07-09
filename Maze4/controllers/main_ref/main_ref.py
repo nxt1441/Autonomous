@@ -15,4 +15,5 @@ def main():
     robot.follow_final_path(main_path, debug_vis=True, replan_interval=60)
 
 
-main()
+if __name__ == '__main__':
+    main()

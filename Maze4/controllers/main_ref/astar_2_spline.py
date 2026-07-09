@@ -10,6 +10,21 @@ class _GridPlanner:
     _WALL_MARGIN = 5.0
     _WALL_COST   = 2.0
     _H_SCALE     = 1.2
+    # Standard A* tie-breaking (Amit Patel, "Heuristics" -- redblobgames):
+    # without this, two routes of genuinely equal cost (very common in a
+    # grid maze with symmetric corridors) tie on f = g + h, and heapq then
+    # falls back to comparing the raw (row, col) heap tuple, which has
+    # nothing to do with path quality. That tie-break is a pure function of
+    # the grid, so replanning from the exact same pose gives the same
+    # result -- but replans fire from a slightly different robot pose and
+    # against a slightly-updated cost map each time, so which of the two
+    # equal-cost routes "wins" the row/col tiebreak can flip between
+    # replans even though nothing meaningful changed, and the robot swaps
+    # between two different-looking paths to the same goal. Multiplying
+    # the heuristic by a hair over 1 breaks ties in favour of nodes closer
+    # to the direct line toward the goal instead, which is both consistent
+    # across replans and the more sensible choice when costs are equal.
+    _TIE_BREAK_EPS = 0.001
 
     # 8-connected 2-step moves: (row_step, col_step, travel_cost)
     _MOVES = [
@@ -30,7 +45,7 @@ class _GridPlanner:
         self._cost_weight = cost_weight
 
     def _heuristic(self, cx, cy, gx, gy):
-        return np.sqrt((cx - gx) ** 2 + (cy - gy) ** 2) * self._H_SCALE
+        return np.sqrt((cx - gx) ** 2 + (cy - gy) ** 2) * self._H_SCALE * (1.0 + self._TIE_BREAK_EPS)
 
     def search(self, sx, sy, gx, gy):
         rows, cols = self._rows, self._cols
