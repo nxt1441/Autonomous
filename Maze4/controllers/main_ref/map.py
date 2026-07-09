@@ -495,7 +495,7 @@ class OccupancyGrid:
     # ── Path planning ─────────────────────────────────────────────────────────
 
     def astar_path(self, start, end, inflation_levels=None, cost_map_override=None,
-                    min_clearance_pixels=None):
+                    min_clearance_pixels=None, allow_unknown=False):
         """A* wrapper that tries multiple obstacle inflation levels.
 
         Parameters:
@@ -508,6 +508,17 @@ class OccupancyGrid:
           inflation_levels alone cannot relax it -- callers that need a
           genuinely tighter squeeze (e.g. right next to a pillar) must lower
           this explicitly too.
+        - allow_unknown: when True, UNKNOWN cells are treated as passable
+          (same as FREESPACE) for this search. UNKNOWN normally blocks A*
+          outright, so a corridor that is physically open but was simply
+          never scanned up close (e.g. a pillar spotted from a distance,
+          without the robot ever walking the space between it and the
+          other pillar) reads as "no route" even though the maze itself is
+          fully connected. Only meant for a last-resort planning tier --
+          callers still get real-obstacle safety from
+          _final_path_hard_clear(), and follow_final_path() reacts live to
+          any actual obstacle the robot meets while driving an
+          unknown-crossing path.
         """
         if inflation_levels is None:
             inflation_levels = ASTAR_INFLATION_LEVELS
@@ -519,6 +530,8 @@ class OccupancyGrid:
         for inflation in inflation_levels:
             base = self.grid_map.copy().astype(np.float32)
             base[base == DEPTH_OBSTACLE] = OBSTACLE
+            if allow_unknown:
+                base[base == UNKNOWN] = FREESPACE
             c_mask = (base == CLOSED)
             g_mask = (base == GREEN_CARPET)
             tmp = base.copy()

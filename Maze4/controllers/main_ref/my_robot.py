@@ -14,6 +14,42 @@ from setup import setup_robot
 
 class MyRobot(Robot):
 
+    # Confidence weights for column-position observations, used by
+    # update_column_estimation to weight-blend new sightings into the
+    # running estimate -- a close, front-facing depth fix is trusted far
+    # more than an ordinary depth fix, which in turn outweighs a distant
+    # bearing-only guess (see _column_bearing_local).
+    COLUMN_WEIGHT_CLOSE  = 5.0
+    COLUMN_WEIGHT_NORMAL = 2.0
+    COLUMN_WEIGHT_ROUGH  = 0.3
+    COLUMN_WEIGHT_CAP    = 20.0
+    # A close-range depth reading taken while the pillar is only just outside
+    # the Astra's 0.6 m blind zone is unreliable: the true nearest surface
+    # pixels return no depth at all, so the percentile-depth estimate is built
+    # from whatever slightly-farther, grazing-angle pixels DO have a valid
+    # reading -- which skews the estimate FARTHER than the pillar's real
+    # position, sometimes enough to push the committed cell out toward (or
+    # past) the map boundary. Once a colour already has a reasonably
+    # confident running estimate, a new sighting that disagrees with it by
+    # more than this (in map cells) is treated as a probable blind-zone/edge
+    # artifact and down-weighted instead of being allowed to drag the fused
+    # position on its own.
+    COLUMN_OUTLIER_MAP_DISTANCE = round(1.0 / RESOLUTION)
+    # The danger band described above, named directly: any depth reading
+    # closer than this is "blind-zone-adjacent" -- taken close enough to the
+    # Astra's hard 0.6 m cutoff that its own nearest, most-reliable pixels
+    # are invisible to the sensor. COLOR_DETECTION_DEPTH_THRESHOLD (0.8 m)
+    # is what currently decides "close enough to trust/confirm", but that
+    # whole range sits almost entirely inside this band -- which is exactly
+    # backwards, since accuracy is worst there, not best. Rather than reopen
+    # the confirm/commit thresholds (used for other things too), a reading
+    # in this band gets its position-fusion weight discounted sharply below
+    # (see _estimate_column_pos / mark_column / mark_on_map) so it can still
+    # confirm "we are close" without dragging the fused position estimate --
+    # accuracy for the actual location is left to farther sightings and the
+    # LiDAR obstacle-blob refinement in _pillar_obstacle_blob_center.
+    DEPTH_BLIND_ADJACENT_M = DEPTH_CAMERA_MIN_RANGE_M + 0.35
+
     # ── Construction ─────────────────────────────────────────────────────────
 
     def __init__(self):
@@ -38,22 +74,26 @@ class MyRobot(Robot):
 
         self.blue_estimated_pos   = None
         self.yellow_estimated_pos = None
-        self.blue_pos_update_count    = 0
-        self.yellow_pos_update_count  = 0
+        # Running confidence total per colour, used to weight-blend new
+        # observations into the estimate (see update_column_estimation) --
+        # a close, front-facing depth fix counts far more than a distant
+        # bearing-only guess, so a stray rough sighting can never drag a
+        # confident estimate around once one exists.
+        self.blue_estimate_weight    = 0.0
+        self.yellow_estimate_weight  = 0.0
+        # Explicit per-colour state: UNSEEN -> ROUGH -> PROVISIONAL -> CONFIRMED.
+        # UNSEEN: nothing seen yet. ROUGH: only low-confidence bearing-only
+        # sightings so far. PROVISIONAL: a real depth-based fix has landed
+        # and accumulated confidence clears the commit-ready threshold --
+        # start_point/end_point get set here. CONFIRMED: a close, front-facing
+        # observation landed -- position is frozen from this point on and
+        # used as the reachability anchor for the final pillar-to-pillar path.
+        self._column_state = {'blue': 'UNSEEN', 'yellow': 'UNSEEN'}
         self.blue_estimation_positions   = []
         self.yellow_estimation_positions = []
         self.blue_prev_estimate_position   = None
         self.yellow_prev_estimate_position = None
         self.estimation_distance_threshold = 0.5
-        # Colors that have been confirmed at close range (front-facing,
-        # < COLOR_DETECTION_DEPTH_THRESHOLD). A column can be provisionally
-        # committed (start_point/end_point set) from farther away so
-        # exploration/frontier logic can use it, but the approach target
-        # keeps being refreshed and the commit keeps being overwritten with
-        # fresher estimates until this confirmation lands -- otherwise the
-        # final pillar-to-pillar path gets planned to a stale, far-off mark
-        # that was never actually reached, which is what left it unreachable.
-        self._column_confirmed_close = set()
         # Floating-wall detection: height-band marking with confirmed,
         # frustum-gated persistence (see _refresh_map_depth). Every point
         # `_depth_obstacle_points_local` returns already lies inside the
@@ -277,7 +317,11 @@ class MyRobot(Robot):
         return np.array([self._odom_x, self._odom_y])
 
     def get_heading(self, kind='deg'):
-        cn  = self.imu['compass'].getValues()
+        # Called from both the main thread and the lidar background thread
+        # (via transform_points_to_world); serialize against step() and
+        # other device reads (see get_pointcloud_2d).
+        with self._step_lock:
+            cn = self.imu['compass'].getValues()
         rad = math.atan2(-cn[1], cn[0])
         return rad if kind == 'rad' else np.degrees(rad)
 
@@ -310,7 +354,8 @@ class MyRobot(Robot):
 
     def robot_on_ground(self, max_tan=0.08):
         try:
-            ax, ay, az = self.imu['accelerometer'].getValues()
+            with self._step_lock:
+                ax, ay, az = self.imu['accelerometer'].getValues()
             pitch = math.atan2(-ax, max(1e-9, math.sqrt(ay * ay + az * az)))
             return abs(math.tan(pitch)) < max_tan
         except Exception:
@@ -355,7 +400,8 @@ class MyRobot(Robot):
         return abs(self.motors['fl'].getVelocity() - self.motors['fr'].getVelocity()) > 0.02
 
     def get_distances(self):
-        return [s.getValue() for s in self.distance_sensors]
+        with self._step_lock:
+            return [s.getValue() for s in self.distance_sensors]
 
     # ── Timed manoeuvres ──────────────────────────────────────────────────────
 
@@ -375,7 +421,16 @@ class MyRobot(Robot):
     def get_pointcloud_2d(self):
         if self.lidar is None:
             return np.array([])
-        pts = self.lidar.getPointCloud()
+        # self.lidar.getPointCloud() is read from both the main thread and
+        # the lidar background thread (_refresh_map_lidar); Webots device
+        # I/O is not documented as safe for concurrent cross-thread access,
+        # and racing it against step() (which also touches the same
+        # controller<->simulator IPC channel) is a plausible cause of the
+        # simulation intermittently freezing at 0x. Reuse the RLock that
+        # already guards step() to serialize every raw device read against
+        # it and against each other.
+        with self._step_lock:
+            pts = self.lidar.getPointCloud()
         if not pts:
             return np.array([])
         arr = np.array([[p.x, p.y] for p in pts], dtype=np.float32)
@@ -429,7 +484,8 @@ class MyRobot(Robot):
         while the encoders report movement, the robot is physically stuck.
         """
         try:
-            pts = self.lidar.getPointCloud()
+            with self._step_lock:
+                pts = self.lidar.getPointCloud()
             if not pts:
                 return None
             arr = np.array([[p.x, p.y] for p in pts], dtype=np.float32)
@@ -489,8 +545,9 @@ class MyRobot(Robot):
         if not self.distance_sensors or len(self.distance_sensors) < 3:
             return np.empty((0, 3), dtype=np.float32)
         try:
-            fl_val = float(self.distance_sensors[0].getValue())
-            fr_val = float(self.distance_sensors[2].getValue())
+            with self._step_lock:
+                fl_val = float(self.distance_sensors[0].getValue())
+                fr_val = float(self.distance_sensors[2].getValue())
         except Exception:
             return np.empty((0, 3), dtype=np.float32)
 
@@ -1035,14 +1092,18 @@ class MyRobot(Robot):
         if self.camera_rgb is None:
             return None
         try:
-            raw = self.camera_rgb.getImage()
+            # Read from both the main thread and the camera background
+            # thread -- serialize against step() and other device reads via
+            # the same lock (see get_pointcloud_2d for why).
+            with self._step_lock:
+                raw = self.camera_rgb.getImage()
+                w = self.camera_rgb.getWidth()
+                h = self.camera_rgb.getHeight()
         except Exception:
             return None
         if not raw:
             return None
         try:
-            w = self.camera_rgb.getWidth()
-            h = self.camera_rgb.getHeight()
             img = np.frombuffer(raw, np.uint8).reshape((h, w, 4))
             if scale != 1.0:
                 img = cv2.resize(img, (max(1, int(w * scale)),
@@ -1063,14 +1124,15 @@ class MyRobot(Robot):
         if self.camera_depth is None:
             return None
         try:
-            raw = self.camera_depth.getRangeImage()
+            with self._step_lock:
+                raw = self.camera_depth.getRangeImage()
+                w = self.camera_depth.getWidth()
+                h = self.camera_depth.getHeight()
         except Exception:
             return None
         if not raw:
             return None
         try:
-            w = self.camera_depth.getWidth()
-            h = self.camera_depth.getHeight()
             depth = np.array(raw).reshape((h, w)) * 100.0
             return np.where(np.isinf(depth), -1, depth).astype(np.int16)
         except Exception:
@@ -1094,11 +1156,17 @@ class MyRobot(Robot):
             hsv = self.get_hsv_image()
         if hsv is None:
             return None
-        if cv2.countNonZero(utils.extract_color_mask(hsv, 'yellow')) >= min_pixels:
-            return 'yellow'
-        if cv2.countNonZero(utils.extract_color_mask(hsv, 'blue')) >= min_pixels:
-            return 'blue'
-        return None
+        # Pick whichever colour has more pixels in view rather than always
+        # favouring yellow -- a fixed yellow-first order starves blue's
+        # _camera_seen_counts (reset to 0 every frame yellow is also
+        # visible, see _camera_loop) whenever both pillars are in frame
+        # together, delaying/dropping blue detection even though it was
+        # clearly visible too.
+        yellow_px = cv2.countNonZero(utils.extract_color_mask(hsv, 'yellow'))
+        blue_px   = cv2.countNonZero(utils.extract_color_mask(hsv, 'blue'))
+        if yellow_px < min_pixels and blue_px < min_pixels:
+            return None
+        return 'yellow' if yellow_px >= blue_px else 'blue'
 
 
     def found_all_2_columns(self):
@@ -1154,12 +1222,13 @@ class MyRobot(Robot):
         if self.camera_depth is None:
             return None
         try:
-            depth_data = self.camera_depth.getRangeImage()
-            if not depth_data:
-                return None
-            w   = self.camera_depth.getWidth()
-            h   = self.camera_depth.getHeight()
-            fov = self.camera_depth.getFov()
+            with self._step_lock:
+                depth_data = self.camera_depth.getRangeImage()
+                if not depth_data:
+                    return None
+                w   = self.camera_depth.getWidth()
+                h   = self.camera_depth.getHeight()
+                fov = self.camera_depth.getFov()
         except Exception:
             return None
         fx = w / (2.0 * np.tan(fov / 2.0))
@@ -1205,7 +1274,7 @@ class MyRobot(Robot):
         self.camera_height_m = estimate
         self._camera_height_calibrated = True
 
-    def _depth_obstacle_points_local(self, pixel_stride=3, max_depth=3.5):
+    def _depth_obstacle_points_local(self, pixel_stride=3, max_depth=3.5, exclude_mask=None):
         """Height-band point extraction (Nav2 ObstacleLayer / STVL style):
         every 3D point whose height falls inside
         [GROUND_EPSILON_M, ROBOT_CLEARANCE_HEIGHT_M] is a collision hazard,
@@ -1229,6 +1298,8 @@ class MyRobot(Robot):
             return np.empty((0, 3), dtype=np.float32)
         depth_arr, fx, fy, cx, cy, w, h = frame
         valid = np.isfinite(depth_arr) & (depth_arr > 0.05) & (depth_arr < max_depth)
+        if exclude_mask is not None and exclude_mask.shape == valid.shape:
+            valid &= ~exclude_mask
         if not np.any(valid):
             return np.empty((0, 3), dtype=np.float32)
 
@@ -1306,10 +1377,11 @@ class MyRobot(Robot):
         if hsv_img is None:
             return None
         try:
-            raw_depth = self.camera_depth.getRangeImage()
-            w = self.camera_depth.getWidth()
-            h = self.camera_depth.getHeight()
-            fov = self.camera_depth.getFov()
+            with self._step_lock:
+                raw_depth = self.camera_depth.getRangeImage()
+                w = self.camera_depth.getWidth()
+                h = self.camera_depth.getHeight()
+                fov = self.camera_depth.getFov()
         except Exception:
             return None
         if not raw_depth:
@@ -1344,13 +1416,78 @@ class MyRobot(Robot):
         height = self.camera_height_m - depth_m * y_n
         return np.array([forward, lateral, height], dtype=np.float32)
 
-    def _depth_wall_blocks_column(self, column_local):
+    def _column_bearing_local(self, color, assumed_forward_m=3.2, max_area_ratio=0.06):
+        """Rough direction-only fallback for when the RGB camera can see a
+        column's colour but it's beyond the depth camera's reliable 3.5 m
+        range (see _column_depth_position_local) -- depth returns nothing
+        usable, so no estimate/marking ever happened for a genuinely distant
+        sighting and exploration had no bias toward it at all.
+
+        Uses only the colour mask's horizontal centroid (bearing), combined
+        with an assumed forward distance, in the same local [forward,
+        lateral, height] convention as the real depth estimate, so it can
+        flow through the exact same projection/estimation path -- just
+        good enough to steer frontier exploration toward the right general
+        direction until the robot gets close enough for a real fix.
+
+        Gated to only fire when the colour blob is still small (a large
+        blob means it's actually close and depth failing is a transient
+        glitch, not an out-of-range sighting -- using the far-away
+        assumption there would plant a wildly wrong point).
+        """
+        hsv = self.get_hsv_image()
+        if hsv is None:
+            return None
+        mask = utils.extract_color_mask(hsv, color)
+        if mask is None or not np.any(mask):
+            return None
+        h, w = mask.shape[:2]
+        area_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        if area_ratio <= 0.0 or area_ratio > max_area_ratio:
+            return None
+        M = cv2.moments(mask)
+        if M['m00'] <= 0:
+            return None
+        u = M['m10'] / M['m00']
+        # Reuse the intrinsics cached at init (same camera, same resolution)
+        # instead of re-querying the device under _step_lock.
+        fx = self.fx * (w / float(self.cam_width))
+        cx = w / 2.0
+        x_n = (u - cx) / fx
+        forward = assumed_forward_m + self.X_offset
+        lateral = -assumed_forward_m * x_n + self.Y_offset
+        height = self.camera_height_m
+        return np.array([forward, lateral, height], dtype=np.float32)
+
+    def _depth_wall_blocks_column(self, column_local, color=None):
         """True if an obstacle sits directly between the robot and the
         column's reported position (i.e. the "column" sighting is actually
         a wall/panel in front of it). `_depth_obstacle_points_local` already
         restricts its output to the robot-blocking height band, so no
-        further height test is needed here."""
-        wall_pts = self._depth_obstacle_points_local(pixel_stride=2, max_depth=3.5)
+        further height test is needed here.
+
+        The column's own body is also inside that height band, so its own
+        near-facing surface pixels used to be counted as "wall" points too.
+        A round pillar's closest single pixel (dead centre) is routinely a
+        few cm nearer than the column-depth estimate (median of the color
+        mask's near 35th percentile, a wider, slightly-farther-averaged
+        sample), so this was tripping "blocked" on the pillar itself --
+        intermittently dropping perfectly clear sightings depending on
+        camera noise/angle. Fixed by excluding the column's own color-mask
+        pixels (dilated a few px for anti-aliased edges) from the wall-point
+        candidates, and by requiring a small cluster (not one stray pixel)
+        of genuinely closer points before calling it blocked.
+        """
+        exclude_mask = None
+        if color is not None:
+            hsv_img = self.get_hsv_image()
+            if hsv_img is not None:
+                col_mask = utils.extract_color_mask(hsv_img, color)
+                if col_mask is not None and np.any(col_mask):
+                    kernel = np.ones((7, 7), np.uint8)
+                    exclude_mask = cv2.dilate(col_mask, kernel, iterations=1) != 0
+        wall_pts = self._depth_obstacle_points_local(
+            pixel_stride=2, max_depth=3.5, exclude_mask=exclude_mask)
         if wall_pts.shape[0] == 0:
             return False
         forward, lateral, _ = column_local
@@ -1361,7 +1498,7 @@ class MyRobot(Robot):
         same_bearing = np.abs(wall_bearing - bearing) < 0.10
         before_column = wall_pts[:, 0] < forward - 0.08
         mask = same_bearing & before_column
-        return bool(np.any(mask))
+        return int(np.count_nonzero(mask)) >= 3
 
     def _column_is_front_facing(self, color):
         return self.get_column_center_ratio(color) >= 0.20
@@ -1692,7 +1829,7 @@ class MyRobot(Robot):
             column_local = self._column_depth_position_local(color)
             if column_local is None:
                 return False
-            if not self._column_is_front_facing(color) and self._depth_wall_blocks_column(column_local):
+            if not self._column_is_front_facing(color) and self._depth_wall_blocks_column(column_local, color=color):
                 return False
             if column_local[0] * 100.0 > COLUMN_COMMIT_MAX_DISTANCE_CM:
                 return False
@@ -1702,16 +1839,26 @@ class MyRobot(Robot):
             wp = column_local[:2] @ R.T + np.array([self._odom_x, self._odom_y])
             mp = self.convert_to_map_coordinates(float(wp[0]), float(wp[1]))
             close = column_local[0] * 100.0 < COLOR_DETECTION_DEPTH_THRESHOLD
+            # Fuse through the running weighted estimate rather than
+            # committing this single raw projection directly -- a lone
+            # close-range frame taken right at the depth camera's 0.6 m
+            # blind-zone edge is the classic source of an overshot mark (see
+            # COLUMN_OUTLIER_MAP_DISTANCE), and the outlier gate inside
+            # update_column_estimation only protects a commit if the
+            # estimate was actually updated through it first.
+            weight = self.COLUMN_WEIGHT_CLOSE if close else self.COLUMN_WEIGHT_NORMAL
+            self.update_column_estimation(color, mp, weight=weight)
+            est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
+            mp = (int(round(float(est[0]))), int(round(float(est[1]))))
         # Maze1 reference: commit the raw projected point. _refine_column_map_position
         # snapped the marker into the pillar's own OBSTACLE blob, which broke plotting.
-        self._set_committed_column(color, mp, close=close)
-        return True
+        return self._set_committed_column(color, mp, close=close)
 
     def mark_on_map(self, distance_cm, color='blue'):
         column_local = self._column_depth_position_local(color)
         if column_local is None:
             return False
-        if not self._column_is_front_facing(color) and self._depth_wall_blocks_column(column_local):
+        if not self._column_is_front_facing(color) and self._depth_wall_blocks_column(column_local, color=color):
             return False
         if column_local[0] * 100.0 < COLOR_DETECTION_DEPTH_THRESHOLD:
             heading = self.get_heading('rad')
@@ -1726,35 +1873,210 @@ class MyRobot(Robot):
                 return False
             # This branch only fires when column_local[0] < COLOR_DETECTION_DEPTH_THRESHOLD,
             # i.e. the pillar is already close -- always a confirmed-close commit.
-            self._set_committed_column(color, mp, close=True)
-            return True
+            # Fuse first (see mark_column) instead of committing this single
+            # close-range frame raw -- otherwise a blind-zone-skewed reading
+            # taken right as the robot closes in can overshoot the real
+            # pillar position, sometimes far enough to land outside the map.
+            self.update_column_estimation(color, mp, weight=self.COLUMN_WEIGHT_CLOSE)
+            est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
+            mp = (int(round(float(est[0]))), int(round(float(est[1]))))
+            return self._set_committed_column(color, mp, close=True)
         return False
 
-    def _set_committed_column(self, color, mp, close=False):
+    def _advance_column_state(self, color, weight=0.0, close=False):
+        """Single place a colour's state (_column_state) transitions:
+        UNSEEN -> ROUGH -> PROVISIONAL -> CONFIRMED. CONFIRMED is frozen --
+        once reached, no further transitions happen (replaces the old
+        _column_confirmed_close set). ROUGH marks that at least one
+        low/any-weight sighting has landed with nothing committed yet.
+        PROVISIONAL follows _column_commit_ready() (real fix + enough
+        accumulated confidence, or already close) -- this is also the point
+        start_point/end_point get set, by the caller in
+        _set_committed_column. CONFIRMED is asserted by the caller once a
+        close, front-facing observation has actually been committed.
+        """
+        state = self._column_state.get(color, 'UNSEEN')
+        if state == 'CONFIRMED':
+            return state
+        if state == 'UNSEEN' and weight > 0.0:
+            state = 'ROUGH'
+        if self._column_commit_ready(color):
+            state = 'PROVISIONAL'
         if close:
-            # Core fix: a depth-camera projection (heading rotation + camera
-            # offset + range) can land the "pillar" map cell inside a wall,
-            # an as-yet-UNKNOWN cell, or a region the map doesn't actually
-            # connect to the rest of explored space -- A* then has no route
-            # to it and the run reports "no path found" even though the
-            # pillar was clearly seen. The known-working reference
-            # (duchieuvn/autonomous2) sidesteps this entirely: once the robot
-            # is within COLOR_DETECTION_DEPTH_THRESHOLD of the column it
-            # commits its own current map cell, not a projected one. The
-            # robot is physically standing there, so the cell is guaranteed
-            # FREESPACE and reachable -- which is exactly what the final
-            # pillar-to-pillar planner needs as an endpoint.
-            mp = tuple(self.get_map_position())
-        self._commit_column_cell(color, mp)
+            state = 'CONFIRMED'
+        self._column_state[color] = state
+        return state
+
+    def _carve_reachability(self, color, mp, marker_pos=None, radius=3):
+        """Wider one-time free-space carve around a just-CONFIRMED pillar
+        position. A depth-camera projection (heading rotation + camera
+        offset + range) can land the pillar's real position inside a wall,
+        an as-yet-UNKNOWN cell, or a region the map doesn't actually
+        connect to the rest of explored space -- A* would then have no
+        route to it, even though the pillar was clearly seen. Rather than
+        substituting the robot's own position as the committed point (which
+        is guaranteed reachable but not the real pillar location, and was
+        the source of the marker-jumps-to-robot / start-goal flicker
+        bugs), carve a guaranteed-FREESPACE bubble right around the real
+        point -- large enough that _final_pillar_access_cell's outward
+        ring-search reliably finds a reachable cell adjacent to it. Reuses
+        _commit_column_cell's existing carve+marker logic, just with a
+        bigger radius than the routine per-sighting radius=1 update.
+        """
+        self._commit_column_cell(color, mp, radius=radius, marker_pos=marker_pos)
+
+    def _pillar_obstacle_blob_center(self, mp, search_radius_cells=None,
+                                      min_blob_cells=2, max_blob_cells=40,
+                                      max_aspect=2.0, min_fill_ratio=0.45):
+        """Snap `mp` onto the centroid of the nearest compact, ISOLATED
+        OBSTACLE blob within `search_radius_cells` -- but only if that blob
+        actually looks like a small standalone pillar footprint, not a
+        wall/corner.
+
+        The pillar is a physical cylinder, so LiDAR marks it as a small
+        OBSTACLE blob in grid_map -- a far more precise fix on the pillar's
+        true position than a single camera-depth projection. Only called
+        AFTER a sighting has already passed every detection gate (a
+        previous version of this idea fed the snapped point back into those
+        gates and broke detection outright).
+
+        A first version of this (size + aspect-ratio only) turned out to
+        also snap onto ordinary maze wall CORNERS: a right-angle wall
+        junction has a roughly square bounding box too (aspect ~= 1), so it
+        passed the old checks and dragged the marker onto the wall bend
+        instead of the pillar out in the open. Two extra checks close that
+        hole:
+
+        - `min_fill_ratio`: area / (bbox_w * bbox_h). A pillar's scanned
+          silhouette is a compact, mostly-filled blob; an L-shaped wall
+          corner has the same bounding box but is mostly empty (only the
+          two thin wall segments are actually OBSTACLE), so it fails a fill
+          ratio a real pillar clears easily.
+        - border check: a genuine free-standing pillar blob, being small,
+          fits entirely inside the search window with room to spare. A wall
+          (including a corner) extends beyond whatever window we cut, so
+          its component's bounding box touches the window edge. Any blob
+          touching the window edge is rejected outright -- it's part of a
+          larger structure, not an isolated pillar.
+        """
+        if search_radius_cells is None:
+            search_radius_cells = max(3, round(0.22 / RESOLUTION))
+        grid = self.grid_map
+        h, w = grid.shape
+        mx, my = int(round(float(mp[0]))), int(round(float(mp[1])))
+        x0, x1 = max(0, mx - search_radius_cells), min(w, mx + search_radius_cells + 1)
+        y0, y1 = max(0, my - search_radius_cells), min(h, my + search_radius_cells + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        sub = (grid[y0:y1, x0:x1] == OBSTACLE).astype(np.uint8)
+        if not np.any(sub):
+            return None
+        try:
+            n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(sub, connectivity=8)
+        except Exception:
+            return None
+        sub_h, sub_w = sub.shape
+        best_label, best_dist = None, float('inf')
+        for label in range(1, n_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < min_blob_cells or area > max_blob_cells:
+                continue
+            left = int(stats[label, cv2.CC_STAT_LEFT])
+            top  = int(stats[label, cv2.CC_STAT_TOP])
+            bw   = int(stats[label, cv2.CC_STAT_WIDTH])
+            bh   = int(stats[label, cv2.CC_STAT_HEIGHT])
+            if left <= 0 or top <= 0 or (left + bw) >= sub_w or (top + bh) >= sub_h:
+                continue  # touches the search window edge -- part of a wall, not isolated
+            aspect = max(bw, bh) / max(1.0, min(bw, bh))
+            if aspect > max_aspect:
+                continue
+            fill_ratio = area / float(bw * bh)
+            if fill_ratio < min_fill_ratio:
+                continue
+            cx, cy = centroids[label]
+            dist = math.hypot((cx + x0) - mx, (cy + y0) - my)
+            if dist < best_dist:
+                best_dist, best_label = dist, label
+        if best_label is None:
+            return None
+        cx, cy = centroids[best_label]
+        cell = (int(round(cx + x0)), int(round(cy + y0)))
+        if not (0 <= cell[0] < w and 0 <= cell[1] < h):
+            return None
+        return cell
+
+    def _set_committed_column(self, color, mp, close=False):
+        """Returns True iff a commit actually happened. Callers (mark_column,
+        mark_on_map, _commit_column_from_estimate) must propagate this --
+        they used to return True unconditionally right after calling this,
+        which silently lied about blue having committed whenever the
+        commit-order gate below blocked it (yellow not done yet). That made
+        _handle_scan_signal/_confirm_pillar_close believe blue was already
+        confirmed and stop pursuing it, even though it was still plainly
+        visible in the camera -- blue looked "skipped" even on a good
+        sighting.
+        """
+        # Commit-order priority: the final path runs blue -> yellow, so
+        # yellow gets committed first. If blue turns up before yellow is
+        # committed, its sighting still updates the running estimate and
+        # steers exploration toward it (see _estimate_column_pos /
+        # _column_biased_target) -- it just isn't allowed to actually commit
+        # (stamp start_point) until yellow is locked in as end_point.
+        if color == 'blue' and self.end_point is None:
+            return False
+        # Once a pillar has been close-confirmed (CONFIRMED), its committed
+        # position is frozen. Without this guard, every later
+        # close+front-facing sighting (e.g. during exploration, before the
+        # final approach) would keep re-committing, which is what used to
+        # make start_point/end_point flicker.
+        if close and self._column_state.get(color) == 'CONFIRMED':
+            return False
+        # A cell outside the grid can never be a real pillar location (the
+        # map covers the whole maze with margin -- see MAP_PHYSICAL_SIZE_M);
+        # it can only be a bad projection (e.g. a blind-zone-skewed
+        # close-range reading). Never let one through as start_point/
+        # end_point -- downstream ring-searches/A* would then be centred
+        # off the map entirely.
+        h, w = self.grid_map.shape
+        if not (0 <= mp[0] < w and 0 <= mp[1] < h):
+            return False
+        # Precise fix: if LiDAR has already accumulated a compact OBSTACLE
+        # blob near the projected point, that blob IS the pillar (it's a
+        # physical cylinder) and pins down its true position far better
+        # than the camera-depth projection that produced `mp` -- snap onto
+        # it. Only refines an already-gated commit; see
+        # _pillar_obstacle_blob_center for why this is safe post-gate but
+        # was not safe pre-gate.
+        refined = self._pillar_obstacle_blob_center(mp)
+        if refined is not None:
+            mp = refined
+        est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
+        # A LiDAR-blob refinement is a real ground-truth fix and should win
+        # over the (possibly still slightly off) running camera estimate for
+        # what gets drawn; otherwise prefer the fused estimate over the raw
+        # single-observation mp.
+        marker_pos = mp if refined is not None else (est if est is not None else mp)
+        # Always commit the real (weight-filtered) estimated position --
+        # never a stand-in for the robot's own pose. A close confirmation
+        # gets the wider reachability carve directly; a provisional commit
+        # gets the routine radius=1 marker update.
+        if close:
+            self._carve_reachability(color, mp, marker_pos=marker_pos)
+        else:
+            self._commit_column_cell(color, mp, marker_pos=marker_pos)
         if color == 'blue':
             self.start_point = mp
         elif color == 'yellow':
             self.end_point = mp
-        if close:
-            self._column_confirmed_close.add(color)
-            if self._column_focus_color == color:
-                self._column_focus_color = None
-                self._column_focus_target = None
+        # Any commit (provisional or close) satisfies _column_is_committed(),
+        # so release the exploration focus now -- otherwise _estimate_column_pos
+        # keeps refreshing it every sighting and exploration never moves on to
+        # look for the other pillar.
+        if self._column_focus_color == color:
+            self._column_focus_color = None
+            self._column_focus_target = None
+        self._advance_column_state(color, close=close)
+        return True
 
     def _column_is_committed(self, color):
         return self.start_point is not None if color == 'blue' else self.end_point is not None
@@ -1765,8 +2087,8 @@ class MyRobot(Robot):
             return False
         if self._column_close_front_visible(color):
             return True
-        updates = self.blue_pos_update_count if color == 'blue' else self.yellow_pos_update_count
-        if updates < COLUMN_COMMIT_MIN_ESTIMATES:
+        weight = self.blue_estimate_weight if color == 'blue' else self.yellow_estimate_weight
+        if weight < self.COLUMN_WEIGHT_NORMAL * COLUMN_COMMIT_MIN_ESTIMATES:
             return False
         if self.get_map_distance(est) <= COLUMN_COMMIT_MAX_MAP_DISTANCE:
             return True
@@ -1786,22 +2108,50 @@ class MyRobot(Robot):
             return False
         mp = (int(round(float(est[0]))), int(round(float(est[1]))))
         close = force or self._column_close_front_visible(color)
-        self._set_committed_column(color, mp, close=close)
-        return True
+        return self._set_committed_column(color, mp, close=close)
 
-    def update_column_estimation(self, color, position):
+    def update_column_estimation(self, color, position, weight=1.0):
+        """Weight-blend a new observation into the running position estimate.
+
+        A confidence total is tracked per colour (blue_estimate_weight /
+        yellow_estimate_weight) and used, along with the new observation's
+        own weight, to compute a weighted average -- so a high-confidence
+        close depth fix barely moves once several have landed, while a
+        low-weight bearing-only guess can still nudge the estimate before
+        any real fix exists, but can't meaningfully perturb one once it
+        does. Total weight is capped so the filter stays responsive to a
+        genuinely different later reading rather than becoming immovable.
+        """
+        position = np.array(position, dtype=float)
         if color == 'blue':
-            if self.blue_estimated_pos is None:
-                self.blue_estimated_pos = position
-            else:
-                self.blue_estimated_pos = (0.3 * np.array(self.blue_estimated_pos) +
-                                           0.7 * np.array(position))
+            old_pos, old_weight = self.blue_estimated_pos, self.blue_estimate_weight
+        else:
+            old_pos, old_weight = self.yellow_estimated_pos, self.yellow_estimate_weight
+        if old_pos is None or old_weight <= 0.0:
+            new_pos, new_weight = position, weight
+        else:
+            # Outlier gate: once a colour already has some confidence built
+            # up, a single sighting that disagrees wildly with it (typically
+            # a close-range blind-zone artifact -- see COLUMN_OUTLIER_MAP_
+            # DISTANCE) is down-weighted hard so it nudges rather than yanks
+            # the fused estimate. A REAL correction still wins if it keeps
+            # showing up over several frames, since each one chips away at
+            # old_weight's share of the total.
+            obs_weight = weight
+            if old_weight >= self.COLUMN_WEIGHT_NORMAL:
+                drift = float(np.linalg.norm(position - np.array(old_pos, dtype=float)))
+                if drift > self.COLUMN_OUTLIER_MAP_DISTANCE:
+                    obs_weight *= 0.1
+            new_weight = old_weight + obs_weight
+            new_pos = (np.array(old_pos, dtype=float) * old_weight +
+                       position * obs_weight) / new_weight
+        new_weight = min(self.COLUMN_WEIGHT_CAP, new_weight)
+        if color == 'blue':
+            self.blue_estimated_pos    = new_pos
+            self.blue_estimate_weight  = new_weight
         elif color == 'yellow':
-            if self.yellow_estimated_pos is None:
-                self.yellow_estimated_pos = position
-            else:
-                self.yellow_estimated_pos = (0.3 * np.array(self.yellow_estimated_pos) +
-                                             0.7 * np.array(position))
+            self.yellow_estimated_pos   = new_pos
+            self.yellow_estimate_weight = new_weight
 
     def _column_line_of_sight_clear(self, mp, end_margin=3):
         robot_mp = self.get_map_position()
@@ -1855,10 +2205,17 @@ class MyRobot(Robot):
                 return best
         return None
 
-    def _commit_column_cell(self, color, mp, radius=1):
+    def _commit_column_cell(self, color, mp, radius=1, marker_pos=None):
         """Mark a small circular marker on the map for the detected column and
         reduce log-odds so the cell is not treated as an obstacle. Also add to
         occ_map.column_points for reliable visualization overlay.
+
+        `mp` is the reachability anchor (may be the robot's own cell when
+        close-confirmed, so A* always has a route to it). `marker_pos`, if
+        given, is the actual estimated pillar location and is what gets drawn
+        -- keeping the two separate means the plotted dot tracks the real
+        pillar instead of jumping to wherever the robot happened to be
+        standing when it confirmed.
         """
         cell_value = BLUE_COLUMN if color == 'blue' else YELLOW_COLUMN
         mx = int(round(float(mp[0]))); my = int(round(float(mp[1])))
@@ -1878,19 +2235,34 @@ class MyRobot(Robot):
                     # Keep grid_map as freespace here; visualization uses occ_map.column_points
                     self.grid_map[ny, nx] = FREESPACE
         # Ensure column_points contains this marker for renderer overlays (avoid duplicates)
+        if marker_pos is not None:
+            vmx, vmy = int(round(float(marker_pos[0]))), int(round(float(marker_pos[1])))
+        else:
+            vmx, vmy = mx, my
         color_rgb = (0, 255, 255) if color == 'blue' else (255, 255, 0)
         pts = list(self.occ_map.column_points) if self.occ_map.column_points else []
-        if not any(px == mx and py == my for px, py, _ in pts):
-            pts.append((mx, my, color_rgb))
-            self.occ_map.column_points = pts
+        pts = [(px, py, c) for px, py, c in pts if c != color_rgb]
+        pts.append((vmx, vmy, color_rgb))
+        self.occ_map.column_points = pts
 
     def _estimate_column_pos(self, color):
         column_local = self._column_depth_position_local(color)
-        if column_local is None:
-            return False
+        rough = column_local is None
+        if rough:
+            # RGB can see the colour but it's beyond the depth camera's
+            # reliable range -- fall back to a bearing-only rough estimate so
+            # exploration still gets steered toward it instead of the
+            # sighting being dropped outright. Assigned a low weight below
+            # (see update_column_estimation), so it can still nudge the
+            # estimate before any real fix exists but can't meaningfully
+            # drag one around once it does -- no separate "already has an
+            # estimate, refuse" gate needed.
+            column_local = self._column_bearing_local(color)
+            if column_local is None:
+                return False
         # If a floating wall blocks the column, record orientation and abort
-        if (not self._column_is_front_facing(color) and
-                self._depth_wall_blocks_column(column_local)):
+        if (not rough and not self._column_is_front_facing(color) and
+                self._depth_wall_blocks_column(column_local, color=color)):
             return False
         heading = self.get_heading('rad')
         R = np.array([[np.cos(heading), -np.sin(heading)],
@@ -1905,23 +2277,33 @@ class MyRobot(Robot):
         front_facing = self._column_is_front_facing(color)
         if not front_facing and not self._column_line_of_sight_clear(mp):
             return False
-        self.update_column_estimation(color, mp)
+        if rough:
+            weight = self.COLUMN_WEIGHT_ROUGH
+        elif front_facing and self._column_close_front_visible(color):
+            weight = self.COLUMN_WEIGHT_CLOSE
+        else:
+            weight = self.COLUMN_WEIGHT_NORMAL
+        self.update_column_estimation(color, mp, weight=weight)
+        self._advance_column_state(color, weight=weight)
         est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
         if est is not None:
-            self._commit_column_cell(color, (int(round(float(est[0]))),
-                                            int(round(float(est[1])))))
+            # A rough bearing-only guess is not accurate enough to stamp on
+            # the map as a marker/clear log-odds around -- only steer
+            # exploration toward it. Once the robot is close enough for a
+            # real depth-based estimate, this same path stamps it normally.
+            if not rough:
+                self._commit_column_cell(color, (int(round(float(est[0]))),
+                                                int(round(float(est[1])))))
             # Keep steering toward the pillar (refreshing the approach target
-            # with each fresher estimate) until it has actually been
-            # confirmed at close range -- a provisional far commit alone
-            # must not stop the approach, or the final stamped position can
-            # be left far from the real pillar.
-            if color not in self._column_confirmed_close:
+            # with each fresher estimate) only until it has been committed
+            # at all (start_point/end_point set) -- close-range confirmation
+            # for both pillars happens later in _confirm_pillar_close(), once
+            # exploration is done. Continuing to refocus here after a
+            # provisional commit would fixate exploration on one pillar
+            # indefinitely and starve the search for the other one.
+            if not self._column_is_committed(color):
                 self._column_focus_color = color
                 self._column_focus_target = self._column_approach_target(est)
-        if color == 'blue':
-            self.blue_pos_update_count += 1
-        else:
-            self.yellow_pos_update_count += 1
         return True
 
     # ── Dynamic path validation and replanning helpers ─────────────────────────
@@ -2062,11 +2444,13 @@ class MyRobot(Robot):
         h, w = grid.shape
         px, py = int(round(float(pillar[0]))), int(round(float(pillar[1])))
         pref = np.array(prefer if prefer is not None else self.get_map_position(), dtype=float)
-        # A close-confirmed pillar cell (see _set_committed_column) IS the
-        # robot's own previously-visited map position, so it is already
-        # guaranteed FREESPACE and reachable -- use it directly instead of
+        # A close-confirmed pillar's own cell gets a guaranteed-FREESPACE
+        # carve around it at confirmation time (see _carve_reachability),
+        # so it's usually directly usable -- try it first instead of
         # searching outward from min_radius, which would otherwise skip the
-        # one cell already proven good.
+        # one cell already known good. Falls through to the ring search
+        # below if the carve didn't leave this exact cell free (e.g. it was
+        # re-covered by a later obstacle observation).
         if (0 <= px < w and 0 <= py < h and grid[py, px] == FREESPACE and
                 not self.occ_map.cell_blocked((px, py))):
             return (px, py)
@@ -2149,8 +2533,40 @@ class MyRobot(Robot):
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
 
+    def _backoff_for_scan_clearance(self, safe_dist_m=0.18, max_ms=600):
+        """Reverse a short distance if something is closer than safe_dist_m
+        directly in front, so scan_360's camera sweep isn't attempted from
+        point-blank range where the pillar's colour can't be segmented."""
+        try:
+            front = self.get_lidar_front_min_dist(angle_range_deg=35)
+        except Exception:
+            return
+        if front >= safe_dist_m:
+            return
+        self.set_robot_velocity(-3.0, -3.0)
+        elapsed = 0
+        step_ms = max(1, self.time_step)
+        while elapsed < max_ms:
+            if self.step(self.time_step) == -1:
+                break
+            elapsed += step_ms
+            try:
+                if self.get_lidar_front_min_dist(angle_range_deg=35) >= safe_dist_m:
+                    break
+            except Exception:
+                break
+        self.stop_motor()
+
     def scan_360(self):
         print('[Scan] 360° rotation...')
+        # If something is right up against the robot (e.g. it ended up
+        # within ~1 cell of a pillar after obstacle recovery or the final
+        # approach), the RGB camera's near-clip plane can put the pillar's
+        # surface closer than the camera can actually render/segment, so a
+        # scan done from point-blank range never picks up its colour no
+        # matter how long it spins. Back off a little first so the pillar is
+        # back inside the camera's working range before rotating.
+        self._backoff_for_scan_clearance()
         # scan_360 is a pure in-place spin — the robot ends up at the same
         # (x, y) it started at. Wheel/ground contact keeps the two encoders
         # from cancelling out exactly, so over hundreds of steps of continuous
@@ -2203,6 +2619,14 @@ class MyRobot(Robot):
             return False
         if isinstance(sig, tuple) and len(sig) >= 2 and sig[0] == 'column':
             color = sig[1]
+            # `sig` can be a single fleeting glimpse popped mid-spin (scan_360
+            # is still rotating at the instant the camera thread pushes it),
+            # so the robot is not necessarily facing the column yet. Always
+            # stop and turn to square up on it first and re-estimate from
+            # that centered view -- committing (even provisionally) off the
+            # raw off-angle glimpse is what produced unreliable, low-quality
+            # marks before.
+            self.center_column_in_view(color)
             estimated = self._estimate_column_pos(color)
             if not estimated:
                 self.center_column_in_view(color)
@@ -2331,8 +2755,7 @@ class MyRobot(Robot):
         target = self._frontier_unknown_target(best_region)
         if target is not None:
             return target
-        return (int(np.mean(cells[:, 0]) + random.randint(-2, 2)),
-                int(np.mean(cells[:, 1]) + random.randint(-2, 2)))
+        return (int(np.mean(cells[:, 0])), int(np.mean(cells[:, 1])))
 
     def _score_frontier_fallback(self, regions, blacklist=None):
         """Fallback when all frontiers are below info_gain threshold.
@@ -2365,38 +2788,77 @@ class MyRobot(Robot):
         target = self._frontier_unknown_target(best_region)
         if target is not None:
             return target
-        return (int(np.mean(cells[:, 0]) + random.randint(-2, 2)),
-                int(np.mean(cells[:, 1]) + random.randint(-2, 2)))
+        return (int(np.mean(cells[:, 0])), int(np.mean(cells[:, 1])))
 
-    def _random_frontier(self, regions):
-        if not regions:
+    def _nearest_unknown_target(self, min_dist=6):
+        """Fallback for when compute_frontiers() finds nothing to chase.
+
+        A leftover pocket of UNKNOWN cells (often right around a pillar that
+        hasn't been detected yet) can be smaller than the frontier
+        clustering's min_size=8 gate, so it never becomes a frontier region
+        even though the map isn't actually fully explored. Search for the
+        nearest reachable raw UNKNOWN cell directly, bypassing the cluster
+        gate, so the robot doesn't stall with "no path to plan" while a
+        pillar is still unaccounted for.
+        """
+        grid = self.grid_map
+        rx, ry = self.get_map_position()
+        ys, xs = np.where(grid == UNKNOWN)
+        if len(xs) == 0:
             return None
-        rpos  = np.array(self.get_map_position(), dtype=float)
-        valid = [r for r in regions if self._frontier_info_gain(r) >= 10]
-        pool  = valid if valid else regions
-        weights = []
-        for r in pool:
-            ig = self._frontier_info_gain(r)
-            c  = np.array(r, dtype=float).mean(axis=0)
-            cx, cy = float(c[0]), float(c[1])
-            d  = float(np.linalg.norm(c - rpos)) + 1.0
-            unknown_ratio = ig / float(ig + max(1, len(r)))
-            local_unknown = self._unknown_neighborhood_score(cx, cy, radius=10)
-            w  = max(0.01, ((max(ig, 5) ** 1.65) *
-                            (0.25 + 3.0 * unknown_ratio + 1.5 * local_unknown) /
-                            math.log1p(d / 5.0)))
-            if self._last_frontier_goal is not None:
-                glx, gly = self._last_frontier_goal
-                gdist = math.sqrt((cx - glx) ** 2 + (cy - gly) ** 2)
-                w *= 1.0 + 3.0 * max(0.0, 1.0 - gdist / 35.0)
-            weights.append(w)
-        chosen = random.choices(pool, weights=weights, k=1)[0]
-        cells  = np.array(chosen)
-        target = self._frontier_unknown_target(chosen)
-        if target is not None:
-            return target
-        return (int(np.mean(cells[:, 0]) + random.randint(-2, 2)),
-                int(np.mean(cells[:, 1]) + random.randint(-2, 2)))
+        d2 = (xs.astype(np.float64) - rx) ** 2 + (ys.astype(np.float64) - ry) ** 2
+        order = np.argsort(d2)
+        for idx in order[:400]:
+            if d2[idx] < min_dist * min_dist:
+                continue
+            x, y = int(xs[idx]), int(ys[idx])
+            if self.occ_map.cell_blocked((x, y)):
+                continue
+            return (x, y)
+        return None
+
+    def _full_map_pillar_search_target(self, grid_spacing=22):
+        """Last-resort fallback once the map is genuinely fully explored
+        (compute_frontiers() has nothing left AND _nearest_unknown_target()
+        found no raw UNKNOWN cell either) but a pillar is still uncommitted.
+
+        The pillar exists somewhere in already-explored free space -- it was
+        simply never squarely faced by a scan_360 (occluded from every angle
+        visited so far, missed because a signal got suppressed by a cooldown,
+        etc.). Rather than stall forever, systematically revisit a spread of
+        vantage points across the known map, closest first, so every part of
+        the explored area eventually gets a fresh look.
+        """
+        grid = self.grid_map
+        if not hasattr(self, '_pillar_search_visited'):
+            self._pillar_search_visited = set()
+        free_ys, free_xs = np.where(grid == FREESPACE)
+        if len(free_xs) == 0:
+            return None
+        rx, ry = self.get_map_position()
+        seen_cells = set()
+        candidates = []
+        for x, y in zip(free_xs.tolist(), free_ys.tolist()):
+            key = (x // grid_spacing, y // grid_spacing)
+            if key in seen_cells or key in self._pillar_search_visited:
+                continue
+            seen_cells.add(key)
+            if self.occ_map.cell_blocked((x, y)):
+                continue
+            d2 = (x - rx) ** 2 + (y - ry) ** 2
+            candidates.append((d2, x, y, key))
+        if not candidates:
+            # Every vantage point has had a look and the pillar still hasn't
+            # turned up -- reset so the sweep starts over. A second pass can
+            # succeed where the first didn't (e.g. approached from a
+            # different heading this time), and this keeps the search alive
+            # indefinitely instead of giving up once the list is exhausted.
+            self._pillar_search_visited = set()
+            return None
+        candidates.sort(key=lambda c: c[0])
+        _, x, y, key = candidates[0]
+        self._pillar_search_visited.add(key)
+        return (x, y)
 
     def _column_biased_target(self, max_jitter=8):
         if self._column_focus_target is not None:
@@ -2420,7 +2882,15 @@ class MyRobot(Robot):
             candidates.append(('blue', self.blue_estimated_pos))
         if not candidates:
             return None
-        color, pos = random.choice(candidates)
+        # Priority: the final path runs blue -> yellow, and yellow is
+        # committed first (see _set_committed_column's commit-order gate).
+        # Always prefer chasing yellow when both are candidates, so
+        # exploration heads toward it directly instead of a coin flip.
+        by_color = {c: p for c, p in candidates}
+        if 'yellow' in by_color:
+            color, pos = 'yellow', by_color['yellow']
+        else:
+            color, pos = 'blue', by_color['blue']
         target = self._column_approach_target(pos)
         if target is not None:
             print(f'[Frontier] Biasing toward {color.upper()} coordinate')
@@ -2626,7 +3096,8 @@ class MyRobot(Robot):
                     time.sleep(0.1)
                     continue
                 try:
-                    now = float(self.getTime())
+                    with self._step_lock:
+                        now = float(self.getTime())
                 except Exception:
                     now = time.time()
                 if (not self.is_turning() and
@@ -2691,12 +3162,13 @@ class MyRobot(Robot):
             chasing = chosen is not None
 
             if chosen is None:
-                if random.random() < 0.90:
-                    chosen = self._score_frontier(regions, blacklist=bl_positions)
-                    self.chosen_frontier_count += 1
-                else:
-                    chosen = self._random_frontier(regions)
-                    self.chosen_frontier_count = 0
+                # Deterministic: always take the best-scored frontier. The
+                # previous 10% random_frontier() branch could jump the goal
+                # to an arbitrary, lower-scored region for no reason tied to
+                # exploration progress, which made the chosen goal
+                # unpredictable run to run.
+                chosen = self._score_frontier(regions, blacklist=bl_positions)
+                self.chosen_frontier_count += 1
 
             if chosen:
                 self._frontier_blacklist.append((chosen[0], chosen[1], count + 100))
@@ -2727,8 +3199,21 @@ class MyRobot(Robot):
         self.start_realtime_planner(goal)
         self.update_realtime_path(cur_path)
         try:
-            while tidx < len(cur_path):
-                target = cur_path[tidx]
+            while cur_path:
+                # Clamp into the current path's bounds instead of using tidx
+                # as a raw loop condition -- `tidx < len(cur_path)` used to
+                # skip the entire waypoint-following loop outright (zero
+                # movement, no advance_to_waypoint call at all) for any path
+                # of 3 or fewer waypoints, since tidx starts at 3. Short
+                # paths are common (final-approach legs, a replan/recovery
+                # swap-in near the goal, ...), so that silently stalled
+                # navigation on a perfectly valid path -- looking like the
+                # lookahead point "spawning at the destination" and the
+                # robot just sitting there unable to move.
+                target_idx   = min(tidx, len(cur_path) - 1)
+                target       = cur_path[target_idx]
+                at_path_end  = target_idx >= len(cur_path) - 1
+                path_swapped = False
 
                 while self.step(self.time_step) != -1:
                     tick += 1
@@ -2737,7 +3222,8 @@ class MyRobot(Robot):
                     if rt:
                         cur_path = rt
                         self.update_realtime_path(cur_path)
-                        tidx = 0  # outer loop adds 3 → starts at path[3]
+                        tidx = 0
+                        path_swapped = True
                         with self.occ_map.vis_lock:
                             self.occ_map.current_path = cur_path
                         print('[RT-Planner] Path swapped in navigate_frontier')
@@ -2759,6 +3245,7 @@ class MyRobot(Robot):
                             cur_path = new
                             self.update_realtime_path(cur_path)
                             tidx = 0
+                            path_swapped = True
                             last_replan_tick = tick
                             break
                         if replan_count >= 4:
@@ -2771,6 +3258,7 @@ class MyRobot(Robot):
                             cur_path = new
                             self.update_realtime_path(cur_path)
                             tidx = 0
+                            path_swapped = True
                             last_replan_tick = tick
                             break
                         return False
@@ -2813,7 +3301,18 @@ class MyRobot(Robot):
 
                     try:
                         interval_hit = bool(replan_interval) and (tick - last_replan_tick >= replan_interval)
-                        if interval_hit:
+                        # Only actually replan here if the current path has
+                        # gone stale -- swapping to a fresh (often only
+                        # marginally different, as the cost map shifts with
+                        # every new LiDAR frame) path on a bare timer resets
+                        # tidx and snaps the lookahead target to a new
+                        # coordinate every ~replan_interval ticks even when
+                        # nothing is actually wrong. That churn is what made
+                        # the lookahead point flutter around the goal instead
+                        # of advancing steadily, and could stall progress
+                        # entirely. Genuine obstruction is already handled by
+                        # the _path_blocked_from_pose() check above this.
+                        if interval_hit and self._path_blocked_from_pose(cur_path, lookahead=18, cost_thresh=0.82):
                             new = self.occ_map.frontier_path(self.get_map_position(), goal)
                             if not new:
                                 new = self.occ_map.astar_path(self.get_map_position(), goal)
@@ -2821,8 +3320,11 @@ class MyRobot(Robot):
                                 cur_path = list(new)
                                 self.update_realtime_path(cur_path)
                                 tidx = 0
+                                path_swapped = True
                                 last_replan_tick = tick
                                 break
+                        elif interval_hit:
+                            last_replan_tick = tick
                     except Exception:
                         pass
 
@@ -2846,6 +3348,7 @@ class MyRobot(Robot):
                             cur_path = list(new)
                             self.update_realtime_path(cur_path)
                             tidx = 0
+                            path_swapped = True
                             last_replan_tick = tick
                             break
                         self.occ_map.visited_frontiers.append(tuple(goal))
@@ -2853,6 +3356,10 @@ class MyRobot(Robot):
                     if reached:
                         break
 
+                if path_swapped:
+                    continue
+                if at_path_end:
+                    break
                 tidx += 3
 
             self.stop_motor()
@@ -3059,7 +3566,7 @@ class MyRobot(Robot):
         boxed in by obstacles can't stall the run forever -- if it never
         confirms, the best (possibly still-far) position found so far is
         kept and used as-is for the final path."""
-        if color in self._column_confirmed_close:
+        if self._column_state.get(color) == 'CONFIRMED':
             return True
         for _ in range(max_attempts):
             est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
@@ -3085,9 +3592,9 @@ class MyRobot(Robot):
             dist = self.estimate_column_distance(color)
             if dist is not None:
                 self.mark_on_map(dist, color=color)
-            if color in self._column_confirmed_close:
+            if self._column_state.get(color) == 'CONFIRMED':
                 return True
-        return color in self._column_confirmed_close
+        return self._column_state.get(color) == 'CONFIRMED'
 
     # ── Main exploration loop ─────────────────────────────────────────────────
 
@@ -3160,17 +3667,95 @@ class MyRobot(Robot):
 
             # One navigation call per iteration — no competing goals
             if path_to_chosen:
+                self._frontier_stall_count = 0
                 ok = self.navigate_frontier(path_to_chosen)
                 if ok:
                     self._last_frontier_goal = chosen
                     if self._active_frontier_goal == tuple(chosen):
                         self._active_frontier_goal = None
                 if ok and chasing and not self.found_all_2_columns():
+                    # Remember which color pulled us here *before* scanning --
+                    # scan_360()/_handle_scan_signal() can clear focus state,
+                    # and if the scan finds nothing at all (scan_sig is None)
+                    # there is otherwise nothing to suspend, so
+                    # _column_biased_target() re-picks the same candidate on
+                    # the very next iteration and we scan_360 again forever
+                    # without frontier exploration ever getting a turn.
+                    chase_color = self._column_focus_color
                     scan_sig = self.scan_360()
                     committed = self._handle_scan_signal(scan_sig)
-                    if (not committed and isinstance(scan_sig, tuple) and
-                            len(scan_sig) >= 2 and scan_sig[0] == 'column'):
-                        self._suspend_column_focus(scan_sig[1], seconds=8.0)
+                    if not committed:
+                        suspend_color = None
+                        if isinstance(scan_sig, tuple) and len(scan_sig) >= 2 and scan_sig[0] == 'column':
+                            suspend_color = scan_sig[1]
+                        elif chase_color is not None:
+                            suspend_color = chase_color
+                        if suspend_color is not None:
+                            self._suspend_column_focus(suspend_color, seconds=8.0)
+                elif ok and not self.found_all_2_columns():
+                    # Ordinary (non-chasing) frontier legs never paused to
+                    # look around -- the camera thread only sees whatever
+                    # happens to be directly ahead while driving, so a
+                    # pillar off to the side or behind the robot at a given
+                    # frontier could be walked straight past and never
+                    # picked up. While a pillar is still missing, give
+                    # detection real priority: pause for a full scan every
+                    # few frontier legs instead of relying purely on
+                    # incidental in-transit sightings.
+                    self._exploration_scan_counter = getattr(self, '_exploration_scan_counter', 0) + 1
+                    if self._exploration_scan_counter >= 3:
+                        self._exploration_scan_counter = 0
+                        scan_sig = self.scan_360()
+                        self._handle_scan_signal(scan_sig)
+            elif not self.found_all_2_columns():
+                # No frontier region was chosen at all this iteration (map
+                # looks fully explored per the cluster gate, or every
+                # candidate failed to plan). If a pillar is still missing,
+                # don't idle -- rescan in place, and if that finds nothing
+                # either, drive toward the nearest raw unknown cell so small
+                # leftover pockets around an undetected pillar still get
+                # visited. Cooldown-gated so a map with nothing left to find
+                # can't turn this into a back-to-back scan_360 spin loop that
+                # starves real navigation.
+                self._frontier_stall_count = getattr(self, '_frontier_stall_count', 0) + 1
+                cooldown_until = getattr(self, '_stall_scan_cooldown_until', 0.0)
+                if self._frontier_stall_count >= 5 and time.time() >= cooldown_until:
+                    self._frontier_stall_count = 0
+                    scan_sig = self.scan_360()
+                    committed = self._handle_scan_signal(scan_sig)
+                    fails = getattr(self, '_stall_scan_fail_count', 0)
+                    if committed:
+                        fails = 0
+                    else:
+                        target = self._nearest_unknown_target()
+                        if target is None:
+                            # Truly nothing left unexplored -- fall back to
+                            # revisiting already-mapped ground to keep
+                            # actively searching for the missing pillar
+                            # instead of stopping path planning altogether.
+                            target = self._full_map_pillar_search_target()
+                        if target is None:
+                            fails += 1
+                        else:
+                            fallback_path = self.occ_map.astar_path(
+                                self.get_map_position(), target,
+                                inflation_levels=[3, 2, 1])
+                            if not fallback_path:
+                                fallback_path = self.occ_map.frontier_path(
+                                    self.get_map_position(), target)
+                            if fallback_path and len(fallback_path) > 2:
+                                fails = 0
+                            else:
+                                fails += 1
+                            if fallback_path and len(fallback_path) > 2:
+                                self.navigate_frontier(fallback_path)
+                    self._stall_scan_fail_count = fails
+                    # Exponential backoff (capped) once repeated stall-scans
+                    # turn up nothing -- there is genuinely nothing left to
+                    # find right now, so keep the scan_360 spin from eating
+                    # all the sim time instead of letting other logic run.
+                    backoff = min(60.0, 5.0 * (2 ** min(fails, 4)))
+                    self._stall_scan_cooldown_until = time.time() + backoff
 
             prev_grid = self.occ_map.grid_map.copy()
 
@@ -3232,18 +3817,6 @@ class MyRobot(Robot):
                       'cell exists near a pillar.')
                 return []
             path = self._plan_final_pillar_path(start_access, end_access)
-            if not path:
-                # astar_path only ever traverses cells already confirmed
-                # FREESPACE -- UNKNOWN cells are treated as blocked by design
-                # (astar_2_spline.py checks `grid == 0`, and UNKNOWN == 255).
-                # The main loop above stops exploring the instant both
-                # pillars are found, which can be well before the region
-                # between them has ever actually been mapped -- so "no
-                # route" here can mean the route is genuinely absent from
-                # the known map yet, not that planning failed. Resume
-                # exploration, bounded, to bridge the gap and retry instead
-                # of giving up on the first attempt.
-                path = self._bridge_explore_and_replan(start_access, end_access, debug=debug)
             if path:
                 print(f'[Explore] Final pillar-to-pillar path: {len(path)} waypoints')
             else:
@@ -3251,47 +3824,6 @@ class MyRobot(Robot):
                       'route at all — pillars are unreachable on the current map.')
             return path or []
         return []
-
-    def _bridge_explore_and_replan(self, start_access, end_access, debug=False,
-                                    max_iters=400, retry_every=20):
-        """Resume ordinary frontier exploration (same machinery as explore()'s
-        main loop) to grow map connectivity between the two already-found
-        pillars, retrying the final plan every `retry_every` iterations, up
-        to `max_iters`. Bounded so an actually-unreachable pair of pillars
-        (e.g. separated by a wall with no corridor) still terminates."""
-        if not self.camera_thread_running:
-            self.start_camera_thread()
-        if not self.lidar_thread_running:
-            self.start_lidar_thread()
-        if debug:
-            try:
-                self.occ_map.start_viz()
-            except Exception:
-                pass
-        print('[Explore] Final route not yet connected — resuming exploration '
-              'to bridge the gap...')
-        prev_grid = self.occ_map.grid_map.copy()
-        path = None
-        count = 0
-        while count < max_iters and self.step(self.time_step) != -1:
-            map_diff = utils.map_delta_ratio(prev_grid, self.occ_map.grid_map)
-            _, chosen, path_to_chosen, _ = self._update_frontier(count, map_diff)
-            if path_to_chosen:
-                self.navigate_frontier(path_to_chosen)
-            prev_grid = self.occ_map.grid_map.copy()
-            count += 1
-            if count % retry_every == 0:
-                path = self._plan_final_pillar_path(start_access, end_access)
-                if path:
-                    break
-        if not path:
-            path = self._plan_final_pillar_path(start_access, end_access)
-        self.stop_camera_thread()
-        self.stop_lidar_thread()
-        if debug:
-            self.occ_map.stop_viz()
-        self.stop_motor()
-        return path
 
     def _plan_final_pillar_path(self, start_access, end_access):
         """Tiered final-path planner for the pillar-to-pillar route.
@@ -3347,6 +3879,26 @@ class MyRobot(Robot):
                 break
 
         candidates = [c for c in candidates if self._final_path_hard_clear(c)]
+
+        if not candidates:
+            # Last resort: every tier above only ever traverses cells already
+            # confirmed FREESPACE -- UNKNOWN cells are treated as blocked by
+            # design (astar_2_spline.py checks `grid == 0`, and UNKNOWN ==
+            # 255). Exploration stops the instant both pillars are found,
+            # which can be well before the region between them has actually
+            # been walked/mapped up close, so "no route" here often just
+            # means the corridor is unscanned, not that it doesn't exist.
+            # Retry once, allowing the search to cross UNKNOWN cells too --
+            # still gated by the same hard-clear check just below, so a
+            # candidate is only accepted if it doesn't actually cross a
+            # confirmed real obstacle; the robot's live obstacle handling in
+            # follow_final_path() covers anything unexpected along the way.
+            unknown_path = self.occ_map.astar_path(
+                start_access, end_access, inflation_levels=[0],
+                min_clearance_pixels=0, allow_unknown=True)
+            if unknown_path and len(unknown_path) > 1:
+                candidates = [c for c in [unknown_path] if self._final_path_hard_clear(c)]
+
         if not candidates:
             return None
 
