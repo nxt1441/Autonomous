@@ -494,16 +494,25 @@ class OccupancyGrid:
 
     # ── Path planning ─────────────────────────────────────────────────────────
 
-    def astar_path(self, start, end, inflation_levels=None, cost_map_override=None):
+    def astar_path(self, start, end, inflation_levels=None, cost_map_override=None,
+                    min_clearance_pixels=None):
         """A* wrapper that tries multiple obstacle inflation levels.
 
         Parameters:
         - start, end: map coordinates
         - inflation_levels: list of inflation pixel values to try (defaults to ASTAR_INFLATION_LEVELS)
         - cost_map_override: numpy array to pass to the planner instead of self.cost_map
+        - min_clearance_pixels: extra post-search clearance re-check margin
+          (defaults to ASTAR_MIN_CLEARANCE_PIXELS). This is applied on top of
+          `inflation` for every level tried below, so passing looser
+          inflation_levels alone cannot relax it -- callers that need a
+          genuinely tighter squeeze (e.g. right next to a pillar) must lower
+          this explicitly too.
         """
         if inflation_levels is None:
             inflation_levels = ASTAR_INFLATION_LEVELS
+        if min_clearance_pixels is None:
+            min_clearance_pixels = ASTAR_MIN_CLEARANCE_PIXELS
         best_path, best_len = None, float('inf')
         fallback_path, fallback_len = None, 0.0
         cost_map_to_use = self.cost_map if cost_map_override is None else cost_map_override
@@ -530,10 +539,11 @@ class OccupancyGrid:
             if any(g_mask[int(py), int(px)] for px, py in path
                    if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
                 continue
-            clearance_tmp = utils.dilate_obstacles(tmp.copy(), inflation_pixels=ASTAR_MIN_CLEARANCE_PIXELS)
-            if any(clearance_tmp[int(py), int(px)] == OBSTACLE for px, py in path[2:-2]
-                   if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
-                continue
+            if min_clearance_pixels > 0:
+                clearance_tmp = utils.dilate_obstacles(tmp.copy(), inflation_pixels=min_clearance_pixels)
+                if any(clearance_tmp[int(py), int(px)] == OBSTACLE for px, py in path[2:-2]
+                       if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
+                    continue
             try:
                 total = 0.0
                 pw = self.robot.convert_to_world_coordinates(path[0][0], path[0][1])
