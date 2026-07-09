@@ -137,10 +137,6 @@ PATH_BLOCKED_LOOKAHEAD_M = 12 * _FRONTIER_TUNING_BASIS_RES
 PATH_BLOCKED_LOOKAHEAD_CELLS = max(1, round(PATH_BLOCKED_LOOKAHEAD_M / RESOLUTION))
 PATH_USABLE_LOOKAHEAD_M = 14 * _FRONTIER_TUNING_BASIS_RES
 PATH_USABLE_LOOKAHEAD_CELLS = max(1, round(PATH_USABLE_LOOKAHEAD_M / RESOLUTION))
-# Used by follow_final_path's own blocked/usable checks on the pillar-to-
-# pillar final path.
-FINAL_PATH_LOOKAHEAD_M = 24 * _FRONTIER_TUNING_BASIS_RES
-FINAL_PATH_LOOKAHEAD_CELLS = max(1, round(FINAL_PATH_LOOKAHEAD_M / RESOLUTION))
 
 # ── Sensor ───────────────────────────────────────────────────────────────────
 # The Astra depth camera (Astra.proto, RangeFinder node) has a hard

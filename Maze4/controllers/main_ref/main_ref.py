@@ -12,7 +12,7 @@ def main():
 
     print(f'[main] Final path found ({len(main_path)} waypoints). Following...')
     robot.step(100)
-    robot.follow_final_path(main_path, debug_vis=True, replan_interval=60)
+    robot.follow_final_path(main_path, debug_vis=True)
 
 
 if __name__ == '__main__':
