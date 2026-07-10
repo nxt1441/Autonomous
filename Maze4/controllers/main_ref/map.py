@@ -234,8 +234,6 @@ class MapRenderer:
                 px, py = int(px), int(py)
                 if 0 <= px < w and 0 <= py < h:
                     rgb[py, px] = (255, 0, 255)  # magenta
-        if target:
-            _mark(target[0], target[1], (255, 140, 0), r=4)  # orange
         if columns:
             for col in columns:
                 if isinstance(col, (list, tuple)) and len(col) >= 3:
@@ -516,6 +514,7 @@ class OccupancyGrid:
         best_path, best_len = None, float('inf')
         fallback_path, fallback_len = None, 0.0
         cost_map_to_use = self.cost_map if cost_map_override is None else cost_map_override
+        tightest_inflation = min(inflation_levels)
         for inflation in inflation_levels:
             base = self.grid_map.copy().astype(np.float32)
             base[base == DEPTH_OBSTACLE] = OBSTACLE
@@ -539,7 +538,20 @@ class OccupancyGrid:
             if any(g_mask[int(py), int(px)] for px, py in path
                    if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
                 continue
-            if min_clearance_pixels > 0:
+            # The tightest configured inflation level already equals
+            # ROBOT_MIN_CLEARANCE_M (the robot's true minimum safe
+            # clearance) -- every cell of a path found on that grid is
+            # already that far from a raw obstacle by construction.
+            # Re-requiring an *additional* min_clearance_pixels margin on
+            # top of it effectively demands inflation + min_clearance
+            # clearance regardless of which level found the path, which
+            # defeats the point of trying progressively tighter levels as
+            # a last resort: a genuinely narrow-but-safe corridor could
+            # never pass this check at any level, leaving astar_path with
+            # no route at all through it. Only apply the extra margin to
+            # paths found at a looser-than-minimum inflation, where there's
+            # room to ask for a more generous clearance.
+            if min_clearance_pixels > 0 and inflation > tightest_inflation:
                 clearance_tmp = utils.dilate_obstacles(tmp.copy(), inflation_pixels=min_clearance_pixels)
                 if any(clearance_tmp[int(py), int(px)] == OBSTACLE for px, py in path[2:-2]
                        if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):

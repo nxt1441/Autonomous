@@ -137,6 +137,10 @@ PATH_BLOCKED_LOOKAHEAD_M = 12 * _FRONTIER_TUNING_BASIS_RES
 PATH_BLOCKED_LOOKAHEAD_CELLS = max(1, round(PATH_BLOCKED_LOOKAHEAD_M / RESOLUTION))
 PATH_USABLE_LOOKAHEAD_M = 14 * _FRONTIER_TUNING_BASIS_RES
 PATH_USABLE_LOOKAHEAD_CELLS = max(1, round(PATH_USABLE_LOOKAHEAD_M / RESOLUTION))
+# Used by follow_final_path's own blocked/usable checks on the pillar-to-
+# pillar final path.
+FINAL_PATH_LOOKAHEAD_M = 24 * _FRONTIER_TUNING_BASIS_RES
+FINAL_PATH_LOOKAHEAD_CELLS = max(1, round(FINAL_PATH_LOOKAHEAD_M / RESOLUTION))
 
 # ── Sensor ───────────────────────────────────────────────────────────────────
 # The Astra depth camera (Astra.proto, RangeFinder node) has a hard
@@ -282,7 +286,6 @@ CAMERA_GREEN_SIGNAL_COOLDOWN = 4.0
 CAMERA_COLUMN_SIGNAL_COOLDOWN = 2.0
 
 # ── Column mapping ───────────────────────────────────────────────────────────
-COLUMN_COMMIT_MAX_DISTANCE_CM = 90
 COLUMN_COMMIT_MAX_MAP_DISTANCE_M = 0.6
 COLUMN_COMMIT_MAX_MAP_DISTANCE = round(COLUMN_COMMIT_MAX_MAP_DISTANCE_M / RESOLUTION)
 COLUMN_COMMIT_MIN_ESTIMATES = 2
