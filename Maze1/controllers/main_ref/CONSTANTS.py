@@ -284,6 +284,11 @@ FLOATING_WALL_FRAME_CLOSE_KERNEL_CELLS = 1
 FLOATING_WALL_FRAME_SUPPORT_RADIUS_CELLS = 1
 FLOATING_WALL_MIN_FRAME_SUPPORT_CELLS = 3
 FLOATING_WALL_MIN_CONFIRMED_COMPONENT_CELLS = 3
+# Once a real floating-wall segment is confirmed, adjacent cells from the same
+# measured panel should not need the full start-from-noise threshold. These
+# extension thresholds only apply near an existing confirmed red segment.
+FLOATING_WALL_ATTACH_MIN_FRAME_SUPPORT_CELLS = 2
+FLOATING_WALL_ATTACH_CONFIRM_VOTES = 2
 # Unconfirmed candidate votes are not permanent evidence. If the camera looks
 # through the same map area and the candidate is not re-seen for this many
 # depth refreshes, discard its accumulated votes so random edge noise cannot

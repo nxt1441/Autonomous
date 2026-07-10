@@ -614,8 +614,10 @@ class MyRobot(Robot):
                     continue
                 near_confirmed = self._floating_near_confirmed(
                     cell, FLOATING_WALL_ATTACH_RADIUS_CELLS)
-                if (self._floating_frame_support(cell, candidate_cells) <
-                        FLOATING_WALL_MIN_FRAME_SUPPORT_CELLS):
+                min_support = (FLOATING_WALL_ATTACH_MIN_FRAME_SUPPORT_CELLS
+                               if near_confirmed
+                               else FLOATING_WALL_MIN_FRAME_SUPPORT_CELLS)
+                if self._floating_frame_support(cell, candidate_cells) < min_support:
                     continue
                 votes = self._floating_votes.get(cell, 0) + 1
                 self._floating_votes[cell] = min(votes, FLOATING_WALL_VOTE_CAP)
@@ -626,7 +628,7 @@ class MyRobot(Robot):
                             if best_range <= FLOATING_WALL_CLOSE_RANGE_M
                             else FLOATING_WALL_CONFIRM_VOTES)
                 if near_confirmed:
-                    required = min(required, FLOATING_WALL_CONFIRM_VOTES_CLOSE)
+                    required = min(required, FLOATING_WALL_ATTACH_CONFIRM_VOTES)
                 if self._floating_votes[cell] >= required:
                     newly_confirmed.add(cell)
 
