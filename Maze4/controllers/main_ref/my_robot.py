@@ -1871,6 +1871,30 @@ class MyRobot(Robot):
             return False
         mp = (int(round(float(est[0]))), int(round(float(est[1]))))
         close = force or self._column_close_front_visible(color)
+        if self._column_is_front_facing(color):
+            # This frame's own precise LiDAR-grounded fix, if one can still
+            # be taken right now -- use it instead of the blended running
+            # average (`est`), which can still be dragged short of the
+            # pillar's true position by earlier lower-confidence sightings
+            # (e.g. a long straight-on approach that accumulated several
+            # normal-weight updates before the robot ever got close) even
+            # once a clean fix exists. Not gated on `close` (< 80 cm): a
+            # straight-on sighting already has an accurate LiDAR range and
+            # reliable bearing well before that range, so restricting this
+            # to only the close case left a pillar seen straight-on from
+            # far away committed short of its true position. Mirrors the
+            # same precise-vs-blended choice _estimate_column_pos makes for
+            # its own inline commit; this covers the other callers that
+            # commit through this function instead (_confirm_pillar_close,
+            # _handle_scan_signal).
+            column_local = self._column_lidar_position_local(color)
+            if column_local is not None:
+                heading = self.get_heading('rad')
+                R = np.array([[np.cos(heading), -np.sin(heading)],
+                              [np.sin(heading),  np.cos(heading)]])
+                wp = column_local[:2] @ R.T + np.array([self._odom_x, self._odom_y])
+                fresh_mp = self.convert_to_map_coordinates(float(wp[0]), float(wp[1]))
+                mp = (int(round(float(fresh_mp[0]))), int(round(float(fresh_mp[1]))))
         return self._set_committed_column(color, mp, close=close)
 
     def update_column_estimation(self, color, position, weight=1.0):
@@ -2040,14 +2064,23 @@ class MyRobot(Robot):
         est = self.blue_estimated_pos if color == 'blue' else self.yellow_estimated_pos
         if est is not None:
             est_cell = (int(round(float(est[0]))), int(round(float(est[1]))))
-            # A close, front-facing sighting is this frame's own precise
-            # LiDAR-grounded fix -- use it as-is rather than the running
-            # weighted-average estimate, which can still be dragged off
-            # by earlier low-confidence rough/normal sightings (taken from
-            # farther away or bad angles) even after a clean close fix
-            # finally lands. Only fall back to the blended estimate when
-            # there is no fresh close fix to anchor on this frame.
-            commit_cell = mp_cell if is_close else est_cell
+            # Any non-rough, front-facing sighting is this frame's own
+            # precise LiDAR-grounded fix -- use it as-is rather than the
+            # running weighted-average estimate, which can still be dragged
+            # off by earlier low-confidence rough/normal sightings (taken
+            # from farther away or bad angles) even after a clean fix
+            # finally lands. This used to be gated on is_close (< 80 cm)
+            # as well, but a straight-on sighting still well outside that
+            # range already has an accurate LiDAR range + reliable bearing
+            # (see _column_is_front_facing) -- gating the fresh fix on
+            # close range alone left a pillar seen straight-on from far
+            # away committed short of its true position, dragged there by
+            # earlier lower-confidence sightings, since it might never
+            # register as "close" before commit fires. Only fall back to
+            # the blended estimate when there is no fresh, reliable fix to
+            # anchor on this frame at all (rough, or badly off-angle).
+            has_fresh_fix = (not rough) and front_facing
+            commit_cell = mp_cell if has_fresh_fix else est_cell
             # A rough bearing-only guess is not accurate enough to mark on
             # the map -- only steer exploration toward it. Once the robot
             # is close enough for a real LiDAR fix, this same path marks it.
@@ -3103,6 +3136,13 @@ class MyRobot(Robot):
             idxs   = list(range(stride, len(p), stride))
             if len(p) - 1 not in idxs:
                 idxs.append(len(p) - 1)
+            # Explicit first target: p[0] is the start pillar's own cell
+            # (explore() prepends it) -- the stride-based indices above
+            # start at `stride` and would otherwise skip driving to it as a
+            # waypoint at all, leaving the start pillar untouched even
+            # though it's now part of the path.
+            if 0 not in idxs:
+                idxs.insert(0, 0)
             idxs = [i for i in idxs if 0 <= i < len(p)]
             return [tuple(p[i]) for i in idxs] or [goal]
 
@@ -3419,6 +3459,17 @@ class MyRobot(Robot):
                 # of giving up on the first attempt.
                 path = self._bridge_explore_and_replan(start_access, end_access, debug=debug)
             if path:
+                # astar_path only ever plans between FREESPACE cells, so
+                # start_access/end_access are the nearest reachable cells
+                # *next to* each pillar, not the pillars themselves (an
+                # obstacle cell can't be a search endpoint) -- the robot
+                # would otherwise stop short of actually touching either
+                # one. Extend the route with the pillars' own cells so
+                # following it drives all the way to contact at both ends;
+                # _final_path_clear()'s endpoint_margin already tolerates an
+                # obstacle right at a path's start/end for exactly this case.
+                path = [tuple(int(c) for c in start_pillar)] + list(path) + \
+                       [tuple(int(c) for c in end_pillar)]
                 print(f'[Explore] Final pillar-to-pillar path: {len(path)} waypoints')
             else:
                 print('[Explore] WARNING: both pillars found but planner found no '
