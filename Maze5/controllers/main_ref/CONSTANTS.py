@@ -62,6 +62,7 @@ ASTAR_FRONTIER_INFLATION_M = max(0.1333, ROBOT_MIN_CLEARANCE_M)
 ASTAR_FRONTIER_INFLATION   = max(1, round(ASTAR_FRONTIER_INFLATION_M / RESOLUTION))
 ASTAR_MIN_CLEARANCE_M      = 0.10
 ASTAR_MIN_CLEARANCE_PIXELS = max(1, round(ASTAR_MIN_CLEARANCE_M / RESOLUTION))
+ASTAR_COST_WEIGHT          = 9.0
 
 # ── Exploration timing ───────────────────────────────────────────────────────
 EXPLORATION_FRONTIER_SELECTION_FREQ = 5
@@ -75,6 +76,7 @@ DWA_DISTANCE_WEIGHT               = 3.5
 DWA_SPEED_WEIGHT                  = 0.05
 DWA_COST_MAP_WEIGHT               = 1.5
 DWA_UNKNOWN_WEIGHT                = 1.2
+DWA_COST_MAP_REJECT_THRESHOLD     = 0.6
 
 # ── Path following ───────────────────────────────────────────────────────────
 PATH_FOLLOWING_TARGET_REACH_DISTANCE_M = 0.1333

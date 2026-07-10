@@ -62,15 +62,6 @@ ASTAR_FRONTIER_INFLATION_M = max(0.1333, ROBOT_MIN_CLEARANCE_M)
 ASTAR_FRONTIER_INFLATION   = max(1, round(ASTAR_FRONTIER_INFLATION_M / RESOLUTION))
 ASTAR_MIN_CLEARANCE_M      = 0.10
 ASTAR_MIN_CLEARANCE_PIXELS = max(1, round(ASTAR_MIN_CLEARANCE_M / RESOLUTION))
-# Per-cell weight applied to the cost map during A* search (see
-# _GridPlanner in astar_2_spline.py). The default cost_weight=1.5 there
-# added at most ~1.5 extra cost for the highest-cost (right-next-to-a-wall)
-# cell, smaller than a single step's own base cost (2.0/2.828) -- so a
-# shorter route hugging a wall could still out-score a longer route that
-# kept more clearance, and the planner would return the wall-hugging one.
-# Raised so a genuinely high-cost cell costs meaningfully more than the
-# detour needed to avoid it, and the search actually prefers to go around.
-ASTAR_COST_WEIGHT = 9.0
 
 # ── Exploration timing ───────────────────────────────────────────────────────
 EXPLORATION_FRONTIER_SELECTION_FREQ = 5
@@ -82,15 +73,8 @@ DWA_ANGULAR_SAMPLES               = [0, 1.5, -1.5, 2.5, -2.5, 3.0, -3.0, 3.5, -3
 DWA_HEADING_WEIGHT                = 4.0
 DWA_DISTANCE_WEIGHT               = 3.5
 DWA_SPEED_WEIGHT                  = 0.05
-DWA_COST_MAP_WEIGHT               = 6.0
+DWA_COST_MAP_WEIGHT               = 1.5
 DWA_UNKNOWN_WEIGHT                = 1.2
-# Trajectories predicted to enter a cell above this cost are rejected
-# outright (not just penalized in the score) -- was 0.92, which only ruled
-# out cells essentially touching a wall and let heading/distance still
-# win close, wall-hugging trajectories over safer wider ones. Lowered so a
-# genuinely tight squeeze past a corner is rejected before it's ever a
-# candidate, rather than merely discouraged.
-DWA_COST_MAP_REJECT_THRESHOLD     = 0.6
 
 # ── Path following ───────────────────────────────────────────────────────────
 PATH_FOLLOWING_TARGET_REACH_DISTANCE_M = 0.1333
@@ -199,16 +183,29 @@ GROUND_EPSILON_M = 0.03
 # from any one maze's wall placement. A point above this height is
 # something the robot fits under and must NOT be marked -- this single
 # threshold IS the passability decision (no separate ratio/quantile check
-# needed downstream). Maze1 has two tall hanging walls only 5 cm apart in
-# clearance (undersides at 0.20 m and 0.25 m); both must be treated as
-# blocking here. Setting the threshold just barely past the higher one
-# (e.g. 0.25-0.26) left only a ~1 cm sliver of that wall's face inside the
-# band -- too thin to reliably hit with sparse depth samples at any
-# distance, so it was only ever caught by the extra pixel density up
-# close, never from farther away. A real margin above the higher
-# underside (0.25 m + 6 cm) gives depth sampling a band wide enough to
-# land hits on that wall's face at normal range, not just close range.
+# needed downstream), which is also why the two tall hanging walls in this
+# maze that differ by only 5 cm of clearance (one blocking, one passable)
+# are still classified correctly: any point at/below this line blocks,
+# every point above it doesn't, decided per point at the moment it's seen.
 ROBOT_CLEARANCE_HEIGHT_M = 0.23
+# A single pixel numerically falling below ROBOT_CLEARANCE_HEIGHT_M is not
+# enough near angled/high surfaces: edge depth noise can make an otherwise
+# passable object appear briefly inside the blocking band. Require local
+# neighborhood support in the depth image before accepting a point as blocking.
+DEPTH_HEIGHT_SUPPORT_KERNEL_PIXELS = 3
+DEPTH_HEIGHT_MIN_BAND_SUPPORT_PIXELS = 3
+DEPTH_HEIGHT_HIGH_NEIGHBOR_MARGIN_M = 0.03
+# If a candidate blocking-band pixel is surrounded by measured pixels that
+# are clearly above robot clearance, treat it as an angled/high-surface edge
+# leak instead of a real blocking surface. This specifically protects
+# passable high floating walls viewed obliquely without using maze geometry.
+DEPTH_HEIGHT_HIGH_VETO_KERNEL_PIXELS = 5
+DEPTH_HEIGHT_MAX_HIGH_VETO_PIXELS = 1
+# A real blocking floating wall has vertical image support inside the
+# robot-height band. A passable high wall seen at an angle usually leaks only
+# a thin edge into that band. Let strong vertical support override the
+# high-neighbor veto so real wall faces are not cut in half.
+DEPTH_HEIGHT_MIN_VERTICAL_SUPPORT_PIXELS = 2
 # Depth-image "flying pixel" silhouette artifacts appear at object edges
 # where the sensor interpolates between a near surface and a much farther
 # background; a genuine surface point's depth is close to its immediate
@@ -266,58 +263,48 @@ FLOATING_WALL_CONFIRM_VOTES = 4
 # trusting fewer independent votes for a cell first seen this close is a
 # reduction in required SAMPLE COUNT, not in required CONFIDENCE.
 FLOATING_WALL_CLOSE_RANGE_M = 1.2
-# WallMedium(3) in Maze1 sits in a tight alcove (boxed in by WallShort(8)/
-# WallShort(11) right next to the blue pillar): those neighbouring walls
-# occlude the camera's line of sight to it until the robot is deep inside
-# the alcove, and even then the corner geometry leaves only part of its
-# face unoccluded -- so it was often glimpsed for a single frame, never
-# two IN A ROW, and 2 required votes was never reached. Since a close-range
-# sighting is already trusted as much lower-error than a far one (see
-# above), a single such sighting is enough evidence on its own -- this
-# isn't a further confidence reduction, it's acknowledging that a
-# partially-occluded wall may only ever offer one usable frame before line
-# of sight is lost again.
-FLOATING_WALL_CONFIRM_VOTES_CLOSE = 1
+FLOATING_WALL_CONFIRM_VOTES_CLOSE = 3
+# When a candidate lands close to an already-confirmed floating wall, it is
+# usually the same panel being re-seen from a different angle. Require fewer
+# exact-cell repeats so view-angle/odometry jitter can extend the existing wall
+# instead of leaving a second unconfirmed dotted trace beside it.
+FLOATING_WALL_ATTACH_RADIUS_M = 0.12
+FLOATING_WALL_ATTACH_RADIUS_CELLS = max(1, round(FLOATING_WALL_ATTACH_RADIUS_M / RESOLUTION))
+FLOATING_WALL_DIRECT_ATTACH_RADIUS_M = 0.06
+FLOATING_WALL_DIRECT_ATTACH_RADIUS_CELLS = max(1, round(FLOATING_WALL_DIRECT_ATTACH_RADIUS_M / RESOLUTION))
 # Vote counter ceiling per cell (just prevents unbounded growth; irrelevant
 # once a cell has already crossed FLOATING_WALL_CONFIRM_VOTES).
 FLOATING_WALL_VOTE_CAP = 8
-# Once a cell crosses the confirmation threshold above, it is frozen forever:
-# this pipeline never re-fits, erases, or moves a confirmed cell again. A
-# newly confirmed cell whose nearest already-mapped wall (lidar OBSTACLE,
-# another confirmed floating cell, or CLOSED) is within this many cells gets
-# a straight bridge drawn to it once, at confirmation time only — real walls
-# in this maze always meet flush, so a leftover few-cell sliver is a mapping
-# gap, not a real passage, and A* would otherwise route straight through it.
-FLOATING_WALL_BRIDGE_RADIUS_M = 0.10
-FLOATING_WALL_BRIDGE_RADIUS_CELLS = max(1, round(FLOATING_WALL_BRIDGE_RADIUS_M / RESOLUTION))
-# A coverage gap WITHIN one physical floating-wall panel (its two visible
-# ends got confirmed, but sampling/occlusion/a brief viewing window never
-# confirmed the cells between them) can be much wider than the seam-bridge
-# radius above, which is deliberately kept small so it can never close off
-# an actually-usable opening. Applied only along the same row or column
-# (never a general radius), so it can only ever merge two points that are
-# candidates for being the SAME straight wall run, not an unrelated object
-# that merely happens to be nearby in some other direction.
-# Maze1's WallMedium(3) (the panel wedged into the alcove next to the blue
-# pillar) is a single ~1 m physical panel, but WallShort(8)/WallShort(11)
-# occlude the camera's view of roughly half its face from every reachable
-# robot position -- only ever one end or the other gets confirmed, never
-# both, and never the middle. The old cap (robot width, ~0.27 m) was
-# "provably safe" in the sense that a narrower gap could never fit the
-# robot regardless -- but it also meant this specific wall's unseen half
-# could never be closed, so the planner routed straight through it. Since
-# this maze has exactly one floating panel long enough to need it, raising
-# the cap to just past that panel's real length (1 m) closes this one gap
-# without loosening the guarantee anywhere it would matter in this maze.
-FLOATING_WALL_GAP_CLOSE_MAX_M = 1.1
-FLOATING_WALL_GAP_CLOSE_MAX_CELLS = max(1, round(FLOATING_WALL_GAP_CLOSE_MAX_M / RESOLUTION))
-# Once two cells of the SAME already-established wall group are confirmed,
-# the straight run between them (per row/column) is filled in immediately —
-# see MyRobot._floating_solidify_group. Capped to this many cells (~1.5 m at
-# this map's resolution, matching the longest WallMedium box run used
-# elsewhere in this maze) so a same-row/column false merge far away can
-# never paint a wall clear across an unrelated part of the map.
-FLOATING_WALL_MAX_SOLIDIFY_SPAN_CELLS = int(1.5 / RESOLUTION)
+# Per-frame depth points from an angled panel or flat plane can be sparse
+# and jittery. Do not morphologically close the frame mask: closing can turn
+# sparse angle noise into filled map patches that were never actually seen.
+FLOATING_WALL_FRAME_LINE_MIN_CELLS = 6
+FLOATING_WALL_FRAME_CLOSE_KERNEL_CELLS = 1
+# Isolated depth-band pixels are usually sensor noise. A candidate must have
+# this many same-frame candidate cells in its local neighborhood before it can
+# earn votes, unless it is extending an already-confirmed floating patch.
+FLOATING_WALL_FRAME_SUPPORT_RADIUS_CELLS = 1
+FLOATING_WALL_MIN_FRAME_SUPPORT_CELLS = 3
+FLOATING_WALL_MIN_CONFIRMED_COMPONENT_CELLS = 3
+# Once a real floating-wall segment is confirmed, adjacent cells from the same
+# measured panel should not need the full start-from-noise threshold. These
+# extension thresholds only apply near an existing confirmed red segment.
+FLOATING_WALL_ATTACH_MIN_FRAME_SUPPORT_CELLS = 2
+FLOATING_WALL_ATTACH_CONFIRM_VOTES = 2
+FLOATING_WALL_DIRECT_ATTACH_CONFIRM_VOTES = 1
+FLOATING_WALL_DIRECT_ATTACH_MIN_NEIGHBORS = 2
+# Unconfirmed candidate votes are not permanent evidence. If the camera looks
+# through the same map area and the candidate is not re-seen for this many
+# depth refreshes, discard its accumulated votes so random edge noise cannot
+# slowly accumulate into a confirmed floating wall.
+FLOATING_WALL_CANDIDATE_MISS_DECAY_FRAMES = 3
+# Confirmed cells are still removable if the camera later revisits the cell
+# and repeatedly does not see robot-height floating evidence there.
+FLOATING_WALL_CONFIRMED_MISS_CLEAR_FRAMES = 10
+# Ignore candidate votes from the first few depth refreshes. The first camera
+# view often contains unsettled angle/height edge noise; delaying confirmation
+# prevents those startup artifacts from freezing into the map.
+FLOATING_WALL_STARTUP_SUPPRESS_FRAMES = 12
 
 # ── Camera detection debounce ────────────────────────────────────────────────
 CAMERA_SIGNAL_MIN_FRAMES = 2
@@ -325,6 +312,7 @@ CAMERA_GREEN_SIGNAL_COOLDOWN = 4.0
 CAMERA_COLUMN_SIGNAL_COOLDOWN = 2.0
 
 # ── Column mapping ───────────────────────────────────────────────────────────
+COLUMN_COMMIT_MAX_DISTANCE_CM = 90
 COLUMN_COMMIT_MAX_MAP_DISTANCE_M = 0.6
 COLUMN_COMMIT_MAX_MAP_DISTANCE = round(COLUMN_COMMIT_MAX_MAP_DISTANCE_M / RESOLUTION)
 COLUMN_COMMIT_MIN_ESTIMATES = 2

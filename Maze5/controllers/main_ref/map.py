@@ -532,7 +532,7 @@ class OccupancyGrid:
                 utils.clear_around_point(tmp, end, inflation_pixels=ASTAR_EXPANSION_PIXELS)
             if not g_mask[int(start[1]), int(start[0])]:
                 utils.clear_around_point(tmp, start, inflation_pixels=ASTAR_EXPANSION_PIXELS)
-            path = _astar(tmp, start, end, cost_map=cost_map_to_use)
+            path = _astar(tmp, start, end, cost_map=cost_map_to_use, cost_weight=ASTAR_COST_WEIGHT)
             if path is None or len(path) <= 1:
                 continue
             if any(g_mask[int(py), int(px)] for px, py in path
@@ -590,7 +590,7 @@ class OccupancyGrid:
             utils.clear_around_point(tmp, end, inflation_pixels=ASTAR_EXPANSION_PIXELS)
         if not g_mask[int(start[1]), int(start[0])]:
             utils.clear_around_point(tmp, start, inflation_pixels=ASTAR_EXPANSION_PIXELS)
-        path = _astar(tmp, start, end, cost_map=self.cost_map)
+        path = _astar(tmp, start, end, cost_map=self.cost_map, cost_weight=ASTAR_COST_WEIGHT)
         if path and any(g_mask[int(py), int(px)] for px, py in path
                         if 0 <= int(px) < self.map_size and 0 <= int(py) < self.map_size):
             return None

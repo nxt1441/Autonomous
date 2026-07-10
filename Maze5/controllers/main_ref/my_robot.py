@@ -1467,7 +1467,7 @@ class MyRobot(Robot):
                         break
                     if (self.occ_map.cost_map is not None and
                             0 <= pmx < MAP_SIZE and 0 <= pmy < MAP_SIZE and
-                            float(self.occ_map.cost_map[pmy, pmx]) > 0.92):
+                            float(self.occ_map.cost_map[pmy, pmx]) > DWA_COST_MAP_REJECT_THRESHOLD):
                         ok = False
                         break
                     if not self.found_all_2_columns():
@@ -3185,12 +3185,12 @@ class MyRobot(Robot):
                     print('[FinalPath] Replan failed after obstacle; continuing supplied path')
 
                 try:
-                    # Looser cost_thresh than exploration's default (0.82) --
-                    # the final leg shouldn't replan over cost-map noise near
-                    # already-committed pillars, only real blockage.
-                    blocked = self._path_blocked_from_pose(cur_path, lookahead=FINAL_PATH_LOOKAHEAD_CELLS, cost_thresh=0.92)
+                    near_pillar = (self.get_map_distance(cur_path[0]) <= 8 or
+                                    self.get_map_distance(cur_path[-1]) <= 8)
+                    cost_thresh = 0.92 if near_pillar else 0.7
+                    blocked = self._path_blocked_from_pose(cur_path, lookahead=FINAL_PATH_LOOKAHEAD_CELLS, cost_thresh=cost_thresh)
                     interval_hit = bool(replan_interval) and (tick - last_replan_tick >= replan_interval)
-                    if blocked or (interval_hit and not self._path_usable_from_pose(cur_path, min_len=3, lookahead=FINAL_PATH_LOOKAHEAD_CELLS, cost_thresh=0.92)):
+                    if blocked or (interval_hit and not self._path_usable_from_pose(cur_path, min_len=3, lookahead=FINAL_PATH_LOOKAHEAD_CELLS, cost_thresh=cost_thresh)):
                         new = self._attempt_replan(goal)
                         if self._final_path_usable(new):
                             cur_path = list(new)
