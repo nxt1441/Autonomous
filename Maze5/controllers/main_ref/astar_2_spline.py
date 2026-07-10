@@ -10,6 +10,21 @@ class _GridPlanner:
     _WALL_MARGIN = 5.0
     _WALL_COST   = 2.0
     _H_SCALE     = 1.2
+    # Standard A* tie-breaking (Amit Patel, "Heuristics" -- redblobgames):
+    # without this, two routes of genuinely equal cost (very common in a
+    # grid maze with symmetric corridors) tie on f = g + h, and heapq then
+    # falls back to comparing the raw (row, col) heap tuple, which has
+    # nothing to do with path quality. That tie-break is a pure function of
+    # the grid, so replanning from the exact same pose gives the same
+    # result -- but replans fire from a slightly different robot pose and
+    # against a slightly-updated cost map each time, so which of the two
+    # equal-cost routes "wins" the row/col tiebreak can flip between
+    # replans even though nothing meaningful changed, and the robot swaps
+    # between two different-looking paths to the same goal. Multiplying
+    # the heuristic by a hair over 1 breaks ties in favour of nodes closer
+    # to the direct line toward the goal instead, which is both consistent
+    # across replans and the more sensible choice when costs are equal.
+    _TIE_BREAK_EPS = 0.001
 
     # 8-connected 2-step moves: (row_step, col_step, travel_cost)
     _MOVES = [
@@ -30,7 +45,7 @@ class _GridPlanner:
         self._cost_weight = cost_weight
 
     def _heuristic(self, cx, cy, gx, gy):
-        return np.sqrt((cx - gx) ** 2 + (cy - gy) ** 2) * self._H_SCALE
+        return np.sqrt((cx - gx) ** 2 + (cy - gy) ** 2) * self._H_SCALE * (1.0 + self._TIE_BREAK_EPS)
 
     def search(self, sx, sy, gx, gy):
         rows, cols = self._rows, self._cols
@@ -50,7 +65,14 @@ class _GridPlanner:
 
             for dy, dx, step in self._MOVES:
                 ny, nx = cy + dy, cx + dx
-                if 0 <= ny < rows and 0 <= nx < cols and self._grid[ny, nx] == 0:
+                my, mx = cy + dy // 2, cx + dx // 2
+                # A 2-cell step only lands on ny,nx -- without also checking
+                # the intermediate cell one step in between, a diagonal (or
+                # straight) move can cut through a 1-cell-wide
+                # obstacle/unknown strip at a corner without the search ever
+                # visiting it.
+                if (0 <= ny < rows and 0 <= nx < cols and self._grid[ny, nx] == 0
+                        and self._grid[my, mx] == 0):
                     extra = (float(self._cost_map[ny, nx]) * self._cost_weight
                              if self._cost_map is not None else 0.0)
                     nc = g_cost[cy, cx] + step + self._penalty[ny, nx] + extra
@@ -122,9 +144,31 @@ def _apply_smoothing(path, method='bspline', smoothness=0.3):
     return _spline_smooth(arr, smoothness)
 
 
+def _path_in_freespace(path, grid):
+    """True iff every (x, y) point of `path` is in-bounds and on a
+    FREESPACE (grid == 0) cell -- the same grid the search itself was
+    constrained to. The raw A* waypoints are guaranteed to satisfy this by
+    construction (search() only ever expands into grid == 0 cells), but a
+    spline fit through them is free to overshoot outside the corridor at a
+    sharp turn, which can send the smoothed path outside the mapped maze
+    boundary entirely."""
+    rows, cols = grid.shape
+    for x, y in path:
+        xi, yi = int(round(x)), int(round(y))
+        if not (0 <= xi < cols and 0 <= yi < rows) or grid[yi, xi] != 0:
+            return False
+    return True
+
+
 def runAStarSearch(grid, start, goal, cost_map=None, cost_weight=1.5):
     planner = _GridPlanner(grid, cost_map=cost_map, cost_weight=cost_weight)
     raw = planner.search(int(start[0]), int(start[1]), int(goal[0]), int(goal[1]))
     if not raw:
         return []
-    return _apply_smoothing(raw, method='bspline', smoothness=0.1)
+    smoothed = _apply_smoothing(raw, method='bspline', smoothness=0.1)
+    if _path_in_freespace(smoothed, grid):
+        return smoothed
+    # Smoothing overshot outside free space (typical at a sharp corridor
+    # turn) -- fall back to the raw, unsmoothed waypoints rather than
+    # silently driving/rendering a path that leaves the mapped maze.
+    return raw
