@@ -45,6 +45,7 @@ class MyRobot(Robot):
         self.blue_prev_estimate_position   = None
         self.yellow_prev_estimate_position = None
         self.estimation_distance_threshold = 0.5
+        self._column_reachability_anchor = {'blue': None, 'yellow': None}
         # Colors that have been confirmed at close range (front-facing,
         # < COLOR_DETECTION_DEPTH_THRESHOLD). A column can be provisionally
         # committed (start_point/end_point set) from farther away so
@@ -74,6 +75,7 @@ class MyRobot(Robot):
         # threshold (see _refresh_map_depth) instead of always needing the
         # full FLOATING_WALL_CONFIRM_VOTES.
         self._floating_best_range = {}
+        self._floating_vote_misses = {}
         self._floating_confirmed = set()
         # Contradiction counter for frustum-gated clearing: how many
         # distinct frames have shown the camera's own line of sight passing
@@ -83,13 +85,13 @@ class MyRobot(Robot):
         # _frustum_clear_floating) — clearing is deliberately much harder
         # to trigger than marking.
         self._floating_clear_votes = {}
-        # Union-find over confirmed cells: cells belonging to the same
-        # physical wall (touching or bridged together) share one root. Used
-        # only to close interior/seam gaps (_floating_solidify_group,
-        # _floating_bridge_gap) — every confirmed cell already blocks the
-        # robot on its own, so no per-group verdict is needed any more.
+        # Union-find over confirmed cells: touching cells belonging to the
+        # same physical wall share one root. Every confirmed cell blocks the
+        # robot on its own; we deliberately do not draw lines across
+        # unobserved gaps, because that produced false floating-wall strokes.
         self._floating_group = {}         # cell -> parent cell (path-compressed)
         self._floating_group_members = {} # root cell -> set of member cells
+        self._floating_depth_frames = 0
 
         self.steps_since_turning  = 0
         self.is_currently_turning = False
@@ -510,20 +512,14 @@ class MyRobot(Robot):
             return np.empty((0, 3), dtype=np.float32)
         return np.array(pts, dtype=np.float32)
 
-    def _refresh_map_depth(self, depth_stride=2, max_depth=3.5):
+    def _refresh_map_depth(self, depth_stride=1, max_depth=3.5):
         """Height-band marking with confirmed, frustum-gated persistence.
 
-        depth_stride=2 (not 3): a floating wall that is narrow in the
-        camera's HORIZONTAL field of view — e.g. one oriented so the robot
-        sees mostly its edge rather than its full face — can project onto
-        only a handful of image columns even at moderate range. A stride-3
-        sample grid can step over that entire narrow column run on every
-        single frame (always landing between it, never on it) for as long
-        as the relative geometry stays similar, so it collects effectively
-        zero votes no matter how many frames go by. Denser sampling makes
-        that systematic miss far less likely; this pipeline is now fully
-        vectorized (no more per-pixel Python loop), so the extra samples
-        cost little.
+        The default uses every depth pixel. A floating wall or plane seen at
+        an angle can project onto a sparse or narrow image region, and a
+        strided sample grid can step over the same cells frame after frame.
+        Dense sampling keeps the map driven by measured depth instead of
+        inferred world geometry.
 
         `_depth_obstacle_points_local` already restricts every point it
         returns to the robot-blocking height band, so every point seen here
@@ -541,6 +537,10 @@ class MyRobot(Robot):
             return
         if not self._camera_height_calibrated:
             self._calibrate_camera_height()
+        self._floating_depth_frames += 1
+        allow_floating_votes = (
+            self._floating_depth_frames > FLOATING_WALL_STARTUP_SUPPRESS_FRAMES
+        )
 
         pts_local = self._depth_obstacle_points_local(pixel_stride=depth_stride,
                                                        max_depth=max_depth)
@@ -554,6 +554,7 @@ class MyRobot(Robot):
             pts_local = np.concatenate([pts_local, ir_pts], axis=0) if pts_local.shape[0] > 0 else ir_pts
 
         heading = self.get_heading('rad')
+        candidate_cells = set()
 
         if pts_local.shape[0] > 0:
             R = np.array([[np.cos(heading), -np.sin(heading)],
@@ -577,7 +578,6 @@ class MyRobot(Robot):
             # so trusting fewer independent close-range votes is not a
             # noise-tolerance regression -- see FLOATING_WALL_CONFIRM_VOTES_CLOSE.
             cell_min_forward = {}
-            candidate_cells = set()
             for (mx, my), forward in zip(map_pts, pts_local[:, 0]):
                 mx_i, my_i = int(mx), int(my)
                 if not (0 <= mx_i < w and 0 <= my_i < h):
@@ -603,9 +603,21 @@ class MyRobot(Robot):
                 if prev is None or forward < prev:
                     cell_min_forward[cell] = float(forward)
 
+            candidate_cells = self._floating_expand_frame_candidates(
+                candidate_cells, cell_min_forward, grid)
+
             newly_confirmed = set()
             for cell in candidate_cells:
                 if cell in self._floating_confirmed:
+                    continue
+                if not allow_floating_votes:
+                    continue
+                near_confirmed = self._floating_near_confirmed(
+                    cell, FLOATING_WALL_ATTACH_RADIUS_CELLS)
+                min_support = (FLOATING_WALL_ATTACH_MIN_FRAME_SUPPORT_CELLS
+                               if near_confirmed
+                               else FLOATING_WALL_MIN_FRAME_SUPPORT_CELLS)
+                if self._floating_frame_support(cell, candidate_cells) < min_support:
                     continue
                 votes = self._floating_votes.get(cell, 0) + 1
                 self._floating_votes[cell] = min(votes, FLOATING_WALL_VOTE_CAP)
@@ -615,6 +627,8 @@ class MyRobot(Robot):
                 required = (FLOATING_WALL_CONFIRM_VOTES_CLOSE
                             if best_range <= FLOATING_WALL_CLOSE_RANGE_M
                             else FLOATING_WALL_CONFIRM_VOTES)
+                if near_confirmed:
+                    required = min(required, FLOATING_WALL_ATTACH_CONFIRM_VOTES)
                 if self._floating_votes[cell] >= required:
                     newly_confirmed.add(cell)
 
@@ -622,11 +636,10 @@ class MyRobot(Robot):
                 self._floating_confirmed.add(cell)
                 self._floating_group[cell] = cell
                 self._floating_group_members[cell] = {cell}
+                self._floating_vote_misses.pop(cell, None)
                 self._floating_merge_touching(cell)
-                self._floating_merge_colinear_gap(cell)
-                self._floating_bridge_gap(cell)
-                self._floating_solidify_group(self._floating_find(cell))
 
+        self._decay_unconfirmed_floating_votes(candidate_cells, heading)
         self._frustum_clear_floating(heading)
 
         # A cell can end up here that LiDAR has since independently
@@ -652,6 +665,7 @@ class MyRobot(Robot):
             for cell in lidar_owned:
                 self._floating_confirmed.discard(cell)
                 self._floating_votes.pop(cell, None)
+                self._floating_vote_misses.pop(cell, None)
                 self._floating_best_range.pop(cell, None)
                 self._floating_clear_votes.pop(cell, None)
                 root = self._floating_find(cell)
@@ -659,6 +673,8 @@ class MyRobot(Robot):
                 if members is not None:
                     members.discard(cell)
                 self._floating_group.pop(cell, None)
+
+        self._prune_floating_noise_components()
 
         if not self._floating_confirmed:
             self.occ_map.floating_points = []
@@ -741,6 +757,150 @@ class MyRobot(Robot):
                 grid[my, mx] = FREESPACE
         self.occ_map._depth_obstacle_cells.difference_update(to_remove)
 
+    def _floating_cell_in_depth_frustum(self, cell, heading, max_depth=3.5):
+        if self.camera_depth is None:
+            return False
+        try:
+            fov_half = float(self.camera_depth.getFov()) / 2.0
+        except Exception:
+            return False
+        wx, wy = self.convert_to_world_coordinates(*cell)
+        dx, dy = wx - self._odom_x, wy - self._odom_y
+        cos_h, sin_h = math.cos(heading), math.sin(heading)
+        fwd = dx * cos_h + dy * sin_h
+        lat = -dx * sin_h + dy * cos_h
+        if not (DEPTH_CLEAR_MIN_RANGE_M < fwd < max_depth):
+            return False
+        return abs(math.atan2(lat, fwd)) <= fov_half * 0.9
+
+    def _decay_unconfirmed_floating_votes(self, candidate_cells, heading):
+        if not self._floating_votes:
+            return
+        for cell in list(self._floating_votes.keys()):
+            if cell in self._floating_confirmed:
+                self._floating_vote_misses.pop(cell, None)
+                continue
+            if cell in candidate_cells:
+                self._floating_vote_misses.pop(cell, None)
+                continue
+            if not self._floating_cell_in_depth_frustum(cell, heading):
+                continue
+            misses = self._floating_vote_misses.get(cell, 0) + 1
+            if misses < FLOATING_WALL_CANDIDATE_MISS_DECAY_FRAMES:
+                self._floating_vote_misses[cell] = misses
+                continue
+            self._floating_vote_misses.pop(cell, None)
+            self._floating_votes.pop(cell, None)
+            self._floating_best_range.pop(cell, None)
+
+    def _floating_near_confirmed(self, cell, radius):
+        if not self._floating_confirmed:
+            return False
+        cx, cy = cell
+        r2 = radius * radius
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx * dx + dy * dy > r2:
+                    continue
+                if (cx + dx, cy + dy) in self._floating_confirmed:
+                    return True
+        return False
+
+    def _floating_candidate_allowed(self, cell, grid):
+        x, y = cell
+        h, w = grid.shape
+        if not (0 <= x < w and 0 <= y < h):
+            return False
+        if grid[y, x] in (OBSTACLE, GREEN_CARPET, CLOSED):
+            return False
+        veto_r = FLOATING_WALL_NEAR_LIDAR_VETO_CELLS
+        y0, y1 = max(0, y - veto_r), min(h, y + veto_r + 1)
+        x0, x1 = max(0, x - veto_r), min(w, x + veto_r + 1)
+        return not np.any(grid[y0:y1, x0:x1] == OBSTACLE)
+
+    def _floating_frame_support(self, cell, candidate_cells):
+        cx, cy = cell
+        r = FLOATING_WALL_FRAME_SUPPORT_RADIUS_CELLS
+        support = 0
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if (cx + dx, cy + dy) in candidate_cells:
+                    support += 1
+        return support
+
+    def _prune_floating_noise_components(self):
+        min_cells = FLOATING_WALL_MIN_CONFIRMED_COMPONENT_CELLS
+        if min_cells <= 1 or not self._floating_confirmed:
+            return
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for x, y in self._floating_confirmed:
+            if 0 <= x < w and 0 <= y < h:
+                mask[y, x] = 1
+        n_labels, labels = cv2.connectedComponents(mask, connectivity=8)
+        if n_labels <= 1:
+            return
+        remove = set()
+        for label in range(1, n_labels):
+            ys, xs = np.where(labels == label)
+            if len(xs) >= min_cells:
+                continue
+            remove.update((int(x), int(y)) for x, y in zip(xs.tolist(), ys.tolist()))
+        for cell in remove:
+            self._floating_confirmed.discard(cell)
+            self._floating_votes.pop(cell, None)
+            self._floating_vote_misses.pop(cell, None)
+            self._floating_best_range.pop(cell, None)
+            self._floating_clear_votes.pop(cell, None)
+            root = self._floating_find(cell)
+            members = self._floating_group_members.get(root)
+            if members is not None:
+                members.discard(cell)
+            self._floating_group.pop(cell, None)
+            x, y = cell
+            if 0 <= x < w and 0 <= y < h and grid[y, x] == DEPTH_OBSTACLE:
+                grid[y, x] = FREESPACE
+        if remove:
+            self.occ_map._depth_obstacle_cells.difference_update(remove)
+
+    def _floating_expand_frame_candidates(self, candidate_cells, cell_min_forward, grid):
+        """Optionally close tiny sampling holes in the cells seen this frame."""
+        if len(candidate_cells) < FLOATING_WALL_FRAME_LINE_MIN_CELLS:
+            return candidate_cells
+
+        k = max(1, int(FLOATING_WALL_FRAME_CLOSE_KERNEL_CELLS))
+        if k <= 1:
+            return candidate_cells
+
+        h, w = grid.shape
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for x, y in candidate_cells:
+            if 0 <= x < w and 0 <= y < h:
+                mask[y, x] = 1
+
+        if k % 2 == 0:
+            k += 1
+        kernel = np.ones((k, k), dtype=np.uint8)
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        expanded = set(candidate_cells)
+        if not np.any(closed):
+            return expanded
+
+        seed = np.zeros((h, w), dtype=np.uint8)
+        for x, y in candidate_cells:
+            seed[y, x] = 1
+        nearest_forward = min(cell_min_forward.values()) if cell_min_forward else float('inf')
+        bys, bxs = np.where((closed > 0) & (seed == 0))
+        for x, y in zip(bxs.tolist(), bys.tolist()):
+            cell = (int(x), int(y))
+            if not self._floating_candidate_allowed(cell, grid):
+                continue
+            expanded.add(cell)
+            cell_min_forward.setdefault(cell, nearest_forward)
+
+        return expanded
+
     def _floating_find(self, cell):
         """Union-find root lookup with path compression."""
         parent = self._floating_group.get(cell, cell)
@@ -772,166 +932,6 @@ class MyRobot(Robot):
                 if neighbor in self._floating_confirmed:
                     self._floating_union(cell, neighbor)
 
-    def _floating_merge_colinear_gap(self, cell):
-        """Close a coverage gap WITHIN one physical floating-wall panel:
-        its two visible ends got confirmed, but sampling/occlusion/a brief
-        viewing window never confirmed the cells between them, leaving a
-        hole the planner would happily route the robot through. Searches
-        only along the same row and the same column (never a general
-        radius) for another confirmed cell belonging to a different group
-        — restricting to the two cardinal directions means this can only
-        ever merge two points that are candidates for being the SAME
-        straight wall run, never an unrelated object that merely happens
-        to be nearby in some other direction. The search distance is
-        capped at FLOATING_WALL_GAP_CLOSE_MAX_CELLS (the robot's own
-        physical width), which is what makes closing it always safe: a
-        gap narrower than the robot itself could never have been a real,
-        driveable passage regardless of what's on either side of it."""
-        cx, cy = cell
-        grid = self.occ_map.grid_map
-        h, w = grid.shape
-        root = self._floating_find(cell)
-        limit = FLOATING_WALL_GAP_CLOSE_MAX_CELLS
-
-        best_x, best_dx = None, None
-        for nx in range(max(0, cx - limit), min(w, cx + limit + 1)):
-            if nx == cx:
-                continue
-            target = (nx, cy)
-            if target in self._floating_confirmed and self._floating_find(target) != root:
-                d = abs(nx - cx)
-                if best_dx is None or d < best_dx:
-                    best_dx, best_x = d, nx
-        if best_x is not None:
-            for x in range(min(cx, best_x) + 1, max(cx, best_x)):
-                c2 = (x, cy)
-                if c2 not in self._floating_confirmed:
-                    self._floating_confirmed.add(c2)
-                    self._floating_group[c2] = c2
-                    self._floating_group_members[c2] = {c2}
-                    self._floating_union(c2, cell)
-            self._floating_union(cell, (best_x, cy))
-            root = self._floating_find(cell)
-
-        best_y, best_dy = None, None
-        for ny in range(max(0, cy - limit), min(h, cy + limit + 1)):
-            if ny == cy:
-                continue
-            target = (cx, ny)
-            if target in self._floating_confirmed and self._floating_find(target) != root:
-                d = abs(ny - cy)
-                if best_dy is None or d < best_dy:
-                    best_dy, best_y = d, ny
-        if best_y is not None:
-            for y in range(min(cy, best_y) + 1, max(cy, best_y)):
-                c2 = (cx, y)
-                if c2 not in self._floating_confirmed:
-                    self._floating_confirmed.add(c2)
-                    self._floating_group[c2] = c2
-                    self._floating_group_members[c2] = {c2}
-                    self._floating_union(c2, cell)
-            self._floating_union(cell, (cx, best_y))
-
-    def _floating_bridge_gap(self, cell):
-        """Close the space between a newly confirmed cell and whatever
-        structure sits within FLOATING_WALL_BRIDGE_RADIUS_CELLS of it — a
-        lidar wall/CLOSED cell, or another confirmed floating-wall cell not
-        already directly touching it. This covers two distinct real gaps at
-        once: (1) a genuine seam where this floating wall meets the next
-        wall or floating wall, and (2) a hole *inside* one physical wall
-        where depth-camera sampling simply hasn't confirmed every cell yet
-        (stride/occlusion) even though flanking cells of the same object
-        are already confirmed. Both cases render as a small strip of
-        unknown/free space the planner would otherwise slip through, so
-        both get bridged the same way: fill the straight-line gap and merge
-        into one connected wall."""
-        grid = self.occ_map.grid_map
-        h, w = grid.shape
-        cx, cy = cell
-        r = FLOATING_WALL_BRIDGE_RADIUS_CELLS
-        best, best_d2, best_is_floating = None, None, False
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                d2 = dx * dx + dy * dy
-                if d2 == 0 or d2 > r * r:
-                    continue
-                nx, ny = cx + dx, cy + dy
-                if not (0 <= nx < w and 0 <= ny < h):
-                    continue
-                target = (nx, ny)
-                is_floating = target in self._floating_confirmed
-                if is_floating and self._floating_find(target) == self._floating_find(cell):
-                    continue  # already the same connected wall
-                is_hard_wall = grid[ny, nx] in (OBSTACLE, CLOSED)
-                if not (is_floating or is_hard_wall):
-                    continue
-                if best_d2 is None or d2 < best_d2:
-                    best_d2, best, best_is_floating = d2, target, is_floating
-        if best is None:
-            return
-        bridge_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.line(bridge_mask, (cx, cy), best, 1, thickness=1)
-        bys, bxs = np.where(bridge_mask > 0)
-        bridge_cells = set(zip(bxs.tolist(), bys.tolist())) - {cell, best}
-        for bc in bridge_cells:
-            if bc not in self._floating_confirmed:
-                self._floating_confirmed.add(bc)
-                self._floating_group[bc] = bc
-                self._floating_group_members[bc] = {bc}
-                self._floating_union(bc, cell)
-        if best_is_floating:
-            self._floating_union(cell, best)
-
-    def _floating_solidify_group(self, root):
-        """Close any remaining interior gap in an already-established wall
-        group by filling straight between its own confirmed members —
-        independently per row and per column, so an L-shaped group (two
-        real walls meeting at a corner) gets each arm filled correctly
-        instead of one diagonal line cutting across the corner.
-
-        This is why a floating wall that is only ever sampled sparsely
-        (a handful of cells scattered along its true run, e.g. because the
-        robot only ever saw it from close range where the depth camera's
-        stride sampling missed most of the interior) still ends up as one
-        solid, gap-free span: as soon as ANY two cells of the same physical
-        wall are confirmed, the entire straight run between them is filled
-        in immediately, without needing every individual cell in between to
-        independently reach FLOATING_WALL_CONFIRM_VOTES on its own."""
-        members = self._floating_group_members.get(root)
-        if not members or len(members) < 2:
-            return
-        grid = self.occ_map.grid_map
-        h, w = grid.shape
-        by_row, by_col = {}, {}
-        for (x, y) in members:
-            by_row.setdefault(y, []).append(x)
-            by_col.setdefault(x, []).append(y)
-
-        added = set()
-        for y, xs in by_row.items():
-            if len(xs) < 2:
-                continue
-            x0, x1 = min(xs), max(xs)
-            if x1 - x0 > FLOATING_WALL_MAX_SOLIDIFY_SPAN_CELLS:
-                continue
-            for x in range(x0, x1 + 1):
-                if 0 <= x < w and (x, y) not in members:
-                    added.add((x, y))
-        for x, ys in by_col.items():
-            if len(ys) < 2:
-                continue
-            y0, y1 = min(ys), max(ys)
-            if y1 - y0 > FLOATING_WALL_MAX_SOLIDIFY_SPAN_CELLS:
-                continue
-            for y in range(y0, y1 + 1):
-                if 0 <= y < h and (x, y) not in members:
-                    added.add((x, y))
-
-        for cell in added:
-            self._floating_confirmed.add(cell)
-            self._floating_group[cell] = root
-            members.add(cell)
-
     def _reset_transient_depth_obstacles(self):
         cells = getattr(self.occ_map, '_depth_obstacle_cells', set())
         if cells:
@@ -943,6 +943,7 @@ class MyRobot(Robot):
             cells.clear()
         self._floating_votes = {}
         self._floating_best_range = {}
+        self._floating_vote_misses = {}
         self._floating_confirmed = set()
         self._floating_clear_votes = {}
         self._floating_group = {}
@@ -1293,6 +1294,42 @@ class MyRobot(Robot):
         height  = self.camera_height_m - d * y_n
 
         band = (height >= GROUND_EPSILON_M) & (height <= ROBOT_CLEARANCE_HEIGHT_M)
+        if np.any(band):
+            height_img = np.full((h, w), np.nan, dtype=np.float32)
+            height_img[vv, uu] = height
+            valid_h = np.isfinite(height_img)
+            band_img = ((height_img >= GROUND_EPSILON_M) &
+                        (height_img <= ROBOT_CLEARANCE_HEIGHT_M) &
+                        valid_h).astype(np.uint8)
+            high_img = (height_img > (ROBOT_CLEARANCE_HEIGHT_M +
+                                      DEPTH_HEIGHT_HIGH_NEIGHBOR_MARGIN_M)).astype(np.uint8)
+            k = max(1, int(DEPTH_HEIGHT_SUPPORT_KERNEL_PIXELS))
+            if k % 2 == 0:
+                k += 1
+            kernel = np.ones((k, k), dtype=np.uint8)
+            band_support = cv2.filter2D(band_img, cv2.CV_16S, kernel,
+                                        borderType=cv2.BORDER_CONSTANT)
+            high_support = cv2.filter2D(high_img, cv2.CV_16S, kernel,
+                                        borderType=cv2.BORDER_CONSTANT)
+            veto_k = max(1, int(DEPTH_HEIGHT_HIGH_VETO_KERNEL_PIXELS))
+            if veto_k % 2 == 0:
+                veto_k += 1
+            veto_kernel = np.ones((veto_k, veto_k), dtype=np.uint8)
+            high_veto_support = cv2.filter2D(high_img, cv2.CV_16S, veto_kernel,
+                                             borderType=cv2.BORDER_CONSTANT)
+            vertical_kernel = np.ones((veto_k, 1), dtype=np.uint8)
+            vertical_band_support = cv2.filter2D(band_img, cv2.CV_16S, vertical_kernel,
+                                                 borderType=cv2.BORDER_CONSTANT)
+            local_band = band_support[vv, uu] >= DEPTH_HEIGHT_MIN_BAND_SUPPORT_PIXELS
+            not_high_edge = high_support[vv, uu] <= band_support[vv, uu]
+            has_vertical_band = (
+                vertical_band_support[vv, uu] >= DEPTH_HEIGHT_MIN_VERTICAL_SUPPORT_PIXELS
+            )
+            not_high_surface = (
+                (high_veto_support[vv, uu] <= DEPTH_HEIGHT_MAX_HIGH_VETO_PIXELS) |
+                has_vertical_band
+            )
+            band &= local_band & not_high_edge & not_high_surface
         if not np.any(band):
             return np.empty((0, 3), dtype=np.float32)
         return np.stack(
@@ -1731,25 +1768,18 @@ class MyRobot(Robot):
         return False
 
     def _set_committed_column(self, color, mp, close=False):
+        marker_mp = (int(round(float(mp[0]))), int(round(float(mp[1]))))
+        anchor_mp = marker_mp
         if close:
-            # Core fix: a depth-camera projection (heading rotation + camera
-            # offset + range) can land the "pillar" map cell inside a wall,
-            # an as-yet-UNKNOWN cell, or a region the map doesn't actually
-            # connect to the rest of explored space -- A* then has no route
-            # to it and the run reports "no path found" even though the
-            # pillar was clearly seen. The known-working reference
-            # (duchieuvn/autonomous2) sidesteps this entirely: once the robot
-            # is within COLOR_DETECTION_DEPTH_THRESHOLD of the column it
-            # commits its own current map cell, not a projected one. The
-            # robot is physically standing there, so the cell is guaranteed
-            # FREESPACE and reachable -- which is exactly what the final
-            # pillar-to-pillar planner needs as an endpoint.
-            mp = tuple(self.get_map_position())
-        self._commit_column_cell(color, mp)
+            # Keep a reachable waypoint near the pillar for A*, but keep the
+            # visible/semantic pillar position at the camera-projected cell.
+            anchor_mp = tuple(self.get_map_position())
+        self._column_reachability_anchor[color] = anchor_mp
+        self._commit_column_cell(color, anchor_mp, marker_pos=marker_mp)
         if color == 'blue':
-            self.start_point = mp
+            self.start_point = marker_mp
         elif color == 'yellow':
-            self.end_point = mp
+            self.end_point = marker_mp
         if close:
             self._column_confirmed_close.add(color)
             if self._column_focus_color == color:
@@ -1855,10 +1885,13 @@ class MyRobot(Robot):
                 return best
         return None
 
-    def _commit_column_cell(self, color, mp, radius=1):
+    def _commit_column_cell(self, color, mp, radius=1, marker_pos=None):
         """Mark a small circular marker on the map for the detected column and
         reduce log-odds so the cell is not treated as an obstacle. Also add to
         occ_map.column_points for reliable visualization overlay.
+
+        `mp` is the reachable anchor cell used by planning. `marker_pos`, if
+        provided, is the actual estimated pillar location drawn on the map.
         """
         cell_value = BLUE_COLUMN if color == 'blue' else YELLOW_COLUMN
         mx = int(round(float(mp[0]))); my = int(round(float(mp[1])))
@@ -1877,12 +1910,17 @@ class MyRobot(Robot):
                         pass
                     # Keep grid_map as freespace here; visualization uses occ_map.column_points
                     self.grid_map[ny, nx] = FREESPACE
-        # Ensure column_points contains this marker for renderer overlays (avoid duplicates)
+        # Ensure column_points contains this marker for renderer overlays.
+        if marker_pos is not None:
+            vmx = int(round(float(marker_pos[0])))
+            vmy = int(round(float(marker_pos[1])))
+        else:
+            vmx, vmy = mx, my
         color_rgb = (0, 255, 255) if color == 'blue' else (255, 255, 0)
         pts = list(self.occ_map.column_points) if self.occ_map.column_points else []
-        if not any(px == mx and py == my for px, py, _ in pts):
-            pts.append((mx, my, color_rgb))
-            self.occ_map.column_points = pts
+        pts = [(px, py, c) for px, py, c in pts if c != color_rgb]
+        pts.append((vmx, vmy, color_rgb))
+        self.occ_map.column_points = pts
 
     def _estimate_column_pos(self, color):
         column_local = self._column_depth_position_local(color)
@@ -2062,11 +2100,9 @@ class MyRobot(Robot):
         h, w = grid.shape
         px, py = int(round(float(pillar[0]))), int(round(float(pillar[1])))
         pref = np.array(prefer if prefer is not None else self.get_map_position(), dtype=float)
-        # A close-confirmed pillar cell (see _set_committed_column) IS the
-        # robot's own previously-visited map position, so it is already
-        # guaranteed FREESPACE and reachable -- use it directly instead of
-        # searching outward from min_radius, which would otherwise skip the
-        # one cell already proven good.
+        # If the provided candidate is already traversable, use it directly.
+        # Close-confirmed robot-side access anchors are preferred by
+        # _column_anchor_access_cell() before this fallback is called.
         if (0 <= px < w and 0 <= py < h and grid[py, px] == FREESPACE and
                 not self.occ_map.cell_blocked((px, py))):
             return (px, py)
@@ -2091,6 +2127,21 @@ class MyRobot(Robot):
             if found_at_radius:
                 return best
         return best
+
+    def _column_anchor_access_cell(self, color):
+        anchor = self._column_reachability_anchor.get(color)
+        if anchor is None:
+            return None
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        x, y = int(round(float(anchor[0]))), int(round(float(anchor[1])))
+        if not (0 <= x < w and 0 <= y < h):
+            return None
+        if grid[y, x] != FREESPACE:
+            return None
+        if self.occ_map.cell_blocked((x, y)):
+            return None
+        return (x, y)
 
     def _reset_waypoint_follow_state(self):
         self.follow_target_last_position = None
@@ -2617,6 +2668,7 @@ class MyRobot(Robot):
     def _lidar_loop(self):
         depth_tick = 0
         last_map_update = -float('inf')
+        last_depth_update = -float('inf')
         while self.lidar_thread_running:
             try:
                 if self.lidar is None:
@@ -2629,14 +2681,16 @@ class MyRobot(Robot):
                     now = float(self.getTime())
                 except Exception:
                     now = time.time()
+                if now - last_depth_update >= 5 * TIME_STEP / 1000.0:
+                    last_depth_update = now
+                    with self.lidar_lock:
+                        self._refresh_map_depth()
                 if (not self.is_turning() and
                         now - last_map_update >= TIME_STEP / 1000.0):
                     last_map_update = now
                     with self.lidar_lock:
                         self._refresh_map_lidar()
                         depth_tick += 1
-                        if depth_tick % 5 == 0:
-                            self._refresh_map_depth()
                         if depth_tick % 30 == 0:
                             self.occ_map.build_cost_map()
                 time.sleep(0.002)
@@ -3223,10 +3277,12 @@ class MyRobot(Robot):
             # robot's current pose. Always blue -> yellow, regardless of
             # which one was physically discovered first during exploration.
             start_pillar, end_pillar = blue, yellow
-            start_access = self._final_pillar_access_cell(
-                start_pillar, prefer=self.get_map_position())
-            end_access = self._final_pillar_access_cell(
-                end_pillar, prefer=start_access or self.get_map_position())
+            start_access = (
+                self._column_anchor_access_cell('blue') or
+                self._final_pillar_access_cell(start_pillar, prefer=self.get_map_position()))
+            end_access = (
+                self._column_anchor_access_cell('yellow') or
+                self._final_pillar_access_cell(end_pillar, prefer=start_access or self.get_map_position()))
             if start_access is None or end_access is None:
                 print('[Explore] WARNING: both pillars found but no free access '
                       'cell exists near a pillar.')
