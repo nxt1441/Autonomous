@@ -508,10 +508,6 @@ class OccupancyGrid:
           inflation_levels alone cannot relax it -- callers that need a
           genuinely tighter squeeze (e.g. right next to a pillar) must lower
           this explicitly too.
-
-        Only ever searches over confirmed FREESPACE -- UNKNOWN cells are
-        blocked, same as any other planning here, so a returned path is
-        always guaranteed to stay within already-mapped free space.
         """
         if inflation_levels is None:
             inflation_levels = ASTAR_INFLATION_LEVELS
