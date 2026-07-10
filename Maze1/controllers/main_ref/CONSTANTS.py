@@ -195,6 +195,17 @@ ROBOT_CLEARANCE_HEIGHT_M = 0.23
 DEPTH_HEIGHT_SUPPORT_KERNEL_PIXELS = 3
 DEPTH_HEIGHT_MIN_BAND_SUPPORT_PIXELS = 3
 DEPTH_HEIGHT_HIGH_NEIGHBOR_MARGIN_M = 0.03
+# If a candidate blocking-band pixel is surrounded by measured pixels that
+# are clearly above robot clearance, treat it as an angled/high-surface edge
+# leak instead of a real blocking surface. This specifically protects
+# passable high floating walls viewed obliquely without using maze geometry.
+DEPTH_HEIGHT_HIGH_VETO_KERNEL_PIXELS = 5
+DEPTH_HEIGHT_MAX_HIGH_VETO_PIXELS = 1
+# A real blocking floating wall has vertical image support inside the
+# robot-height band. A passable high wall seen at an angle usually leaks only
+# a thin edge into that band. Let strong vertical support override the
+# high-neighbor veto so real wall faces are not cut in half.
+DEPTH_HEIGHT_MIN_VERTICAL_SUPPORT_PIXELS = 2
 # Depth-image "flying pixel" silhouette artifacts appear at object edges
 # where the sensor interpolates between a near surface and a much farther
 # background; a genuine surface point's depth is close to its immediate
@@ -252,7 +263,7 @@ FLOATING_WALL_CONFIRM_VOTES = 4
 # trusting fewer independent votes for a cell first seen this close is a
 # reduction in required SAMPLE COUNT, not in required CONFIDENCE.
 FLOATING_WALL_CLOSE_RANGE_M = 1.2
-FLOATING_WALL_CONFIRM_VOTES_CLOSE = 2
+FLOATING_WALL_CONFIRM_VOTES_CLOSE = 3
 # When a candidate lands close to an already-confirmed floating wall, it is
 # usually the same panel being re-seen from a different angle. Require fewer
 # exact-cell repeats so view-angle/odometry jitter can extend the existing wall
@@ -263,16 +274,25 @@ FLOATING_WALL_ATTACH_RADIUS_CELLS = max(1, round(FLOATING_WALL_ATTACH_RADIUS_M /
 # once a cell has already crossed FLOATING_WALL_CONFIRM_VOTES).
 FLOATING_WALL_VOTE_CAP = 8
 # Per-frame depth points from an angled panel or flat plane can be sparse
-# and jittery. Only close tiny holes in the cells actually observed this
-# frame; do not extrapolate long wall runs from a fitted line.
+# and jittery. Do not morphologically close the frame mask: closing can turn
+# sparse angle noise into filled map patches that were never actually seen.
 FLOATING_WALL_FRAME_LINE_MIN_CELLS = 6
-FLOATING_WALL_FRAME_CLOSE_KERNEL_CELLS = 3
+FLOATING_WALL_FRAME_CLOSE_KERNEL_CELLS = 1
 # Isolated depth-band pixels are usually sensor noise. A candidate must have
 # this many same-frame candidate cells in its local neighborhood before it can
 # earn votes, unless it is extending an already-confirmed floating patch.
 FLOATING_WALL_FRAME_SUPPORT_RADIUS_CELLS = 1
 FLOATING_WALL_MIN_FRAME_SUPPORT_CELLS = 3
 FLOATING_WALL_MIN_CONFIRMED_COMPONENT_CELLS = 3
+# Unconfirmed candidate votes are not permanent evidence. If the camera looks
+# through the same map area and the candidate is not re-seen for this many
+# depth refreshes, discard its accumulated votes so random edge noise cannot
+# slowly accumulate into a confirmed floating wall.
+FLOATING_WALL_CANDIDATE_MISS_DECAY_FRAMES = 3
+# Ignore candidate votes from the first few depth refreshes. The first camera
+# view often contains unsettled angle/height edge noise; delaying confirmation
+# prevents those startup artifacts from freezing into the map.
+FLOATING_WALL_STARTUP_SUPPRESS_FRAMES = 12
 
 # ── Camera detection debounce ────────────────────────────────────────────────
 CAMERA_SIGNAL_MIN_FRAMES = 2

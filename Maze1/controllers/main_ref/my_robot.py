@@ -75,6 +75,7 @@ class MyRobot(Robot):
         # threshold (see _refresh_map_depth) instead of always needing the
         # full FLOATING_WALL_CONFIRM_VOTES.
         self._floating_best_range = {}
+        self._floating_vote_misses = {}
         self._floating_confirmed = set()
         # Contradiction counter for frustum-gated clearing: how many
         # distinct frames have shown the camera's own line of sight passing
@@ -90,6 +91,7 @@ class MyRobot(Robot):
         # unobserved gaps, because that produced false floating-wall strokes.
         self._floating_group = {}         # cell -> parent cell (path-compressed)
         self._floating_group_members = {} # root cell -> set of member cells
+        self._floating_depth_frames = 0
 
         self.steps_since_turning  = 0
         self.is_currently_turning = False
@@ -535,6 +537,10 @@ class MyRobot(Robot):
             return
         if not self._camera_height_calibrated:
             self._calibrate_camera_height()
+        self._floating_depth_frames += 1
+        allow_floating_votes = (
+            self._floating_depth_frames > FLOATING_WALL_STARTUP_SUPPRESS_FRAMES
+        )
 
         pts_local = self._depth_obstacle_points_local(pixel_stride=depth_stride,
                                                        max_depth=max_depth)
@@ -548,6 +554,7 @@ class MyRobot(Robot):
             pts_local = np.concatenate([pts_local, ir_pts], axis=0) if pts_local.shape[0] > 0 else ir_pts
 
         heading = self.get_heading('rad')
+        candidate_cells = set()
 
         if pts_local.shape[0] > 0:
             R = np.array([[np.cos(heading), -np.sin(heading)],
@@ -571,7 +578,6 @@ class MyRobot(Robot):
             # so trusting fewer independent close-range votes is not a
             # noise-tolerance regression -- see FLOATING_WALL_CONFIRM_VOTES_CLOSE.
             cell_min_forward = {}
-            candidate_cells = set()
             for (mx, my), forward in zip(map_pts, pts_local[:, 0]):
                 mx_i, my_i = int(mx), int(my)
                 if not (0 <= mx_i < w and 0 <= my_i < h):
@@ -604,6 +610,8 @@ class MyRobot(Robot):
             for cell in candidate_cells:
                 if cell in self._floating_confirmed:
                     continue
+                if not allow_floating_votes:
+                    continue
                 near_confirmed = self._floating_near_confirmed(
                     cell, FLOATING_WALL_ATTACH_RADIUS_CELLS)
                 if (self._floating_frame_support(cell, candidate_cells) <
@@ -626,8 +634,10 @@ class MyRobot(Robot):
                 self._floating_confirmed.add(cell)
                 self._floating_group[cell] = cell
                 self._floating_group_members[cell] = {cell}
+                self._floating_vote_misses.pop(cell, None)
                 self._floating_merge_touching(cell)
 
+        self._decay_unconfirmed_floating_votes(candidate_cells, heading)
         self._frustum_clear_floating(heading)
 
         # A cell can end up here that LiDAR has since independently
@@ -653,6 +663,7 @@ class MyRobot(Robot):
             for cell in lidar_owned:
                 self._floating_confirmed.discard(cell)
                 self._floating_votes.pop(cell, None)
+                self._floating_vote_misses.pop(cell, None)
                 self._floating_best_range.pop(cell, None)
                 self._floating_clear_votes.pop(cell, None)
                 root = self._floating_find(cell)
@@ -744,6 +755,42 @@ class MyRobot(Robot):
                 grid[my, mx] = FREESPACE
         self.occ_map._depth_obstacle_cells.difference_update(to_remove)
 
+    def _floating_cell_in_depth_frustum(self, cell, heading, max_depth=3.5):
+        if self.camera_depth is None:
+            return False
+        try:
+            fov_half = float(self.camera_depth.getFov()) / 2.0
+        except Exception:
+            return False
+        wx, wy = self.convert_to_world_coordinates(*cell)
+        dx, dy = wx - self._odom_x, wy - self._odom_y
+        cos_h, sin_h = math.cos(heading), math.sin(heading)
+        fwd = dx * cos_h + dy * sin_h
+        lat = -dx * sin_h + dy * cos_h
+        if not (DEPTH_CLEAR_MIN_RANGE_M < fwd < max_depth):
+            return False
+        return abs(math.atan2(lat, fwd)) <= fov_half * 0.9
+
+    def _decay_unconfirmed_floating_votes(self, candidate_cells, heading):
+        if not self._floating_votes:
+            return
+        for cell in list(self._floating_votes.keys()):
+            if cell in self._floating_confirmed:
+                self._floating_vote_misses.pop(cell, None)
+                continue
+            if cell in candidate_cells:
+                self._floating_vote_misses.pop(cell, None)
+                continue
+            if not self._floating_cell_in_depth_frustum(cell, heading):
+                continue
+            misses = self._floating_vote_misses.get(cell, 0) + 1
+            if misses < FLOATING_WALL_CANDIDATE_MISS_DECAY_FRAMES:
+                self._floating_vote_misses[cell] = misses
+                continue
+            self._floating_vote_misses.pop(cell, None)
+            self._floating_votes.pop(cell, None)
+            self._floating_best_range.pop(cell, None)
+
     def _floating_near_confirmed(self, cell, radius):
         if not self._floating_confirmed:
             return False
@@ -801,6 +848,7 @@ class MyRobot(Robot):
         for cell in remove:
             self._floating_confirmed.discard(cell)
             self._floating_votes.pop(cell, None)
+            self._floating_vote_misses.pop(cell, None)
             self._floating_best_range.pop(cell, None)
             self._floating_clear_votes.pop(cell, None)
             root = self._floating_find(cell)
@@ -815,8 +863,12 @@ class MyRobot(Robot):
             self.occ_map._depth_obstacle_cells.difference_update(remove)
 
     def _floating_expand_frame_candidates(self, candidate_cells, cell_min_forward, grid):
-        """Close tiny sampling holes in the cells actually seen this frame."""
+        """Optionally close tiny sampling holes in the cells seen this frame."""
         if len(candidate_cells) < FLOATING_WALL_FRAME_LINE_MIN_CELLS:
+            return candidate_cells
+
+        k = max(1, int(FLOATING_WALL_FRAME_CLOSE_KERNEL_CELLS))
+        if k <= 1:
             return candidate_cells
 
         h, w = grid.shape
@@ -825,7 +877,6 @@ class MyRobot(Robot):
             if 0 <= x < w and 0 <= y < h:
                 mask[y, x] = 1
 
-        k = max(1, int(FLOATING_WALL_FRAME_CLOSE_KERNEL_CELLS))
         if k % 2 == 0:
             k += 1
         kernel = np.ones((k, k), dtype=np.uint8)
@@ -890,6 +941,7 @@ class MyRobot(Robot):
             cells.clear()
         self._floating_votes = {}
         self._floating_best_range = {}
+        self._floating_vote_misses = {}
         self._floating_confirmed = set()
         self._floating_clear_votes = {}
         self._floating_group = {}
@@ -1257,9 +1309,25 @@ class MyRobot(Robot):
                                         borderType=cv2.BORDER_CONSTANT)
             high_support = cv2.filter2D(high_img, cv2.CV_16S, kernel,
                                         borderType=cv2.BORDER_CONSTANT)
+            veto_k = max(1, int(DEPTH_HEIGHT_HIGH_VETO_KERNEL_PIXELS))
+            if veto_k % 2 == 0:
+                veto_k += 1
+            veto_kernel = np.ones((veto_k, veto_k), dtype=np.uint8)
+            high_veto_support = cv2.filter2D(high_img, cv2.CV_16S, veto_kernel,
+                                             borderType=cv2.BORDER_CONSTANT)
+            vertical_kernel = np.ones((veto_k, 1), dtype=np.uint8)
+            vertical_band_support = cv2.filter2D(band_img, cv2.CV_16S, vertical_kernel,
+                                                 borderType=cv2.BORDER_CONSTANT)
             local_band = band_support[vv, uu] >= DEPTH_HEIGHT_MIN_BAND_SUPPORT_PIXELS
             not_high_edge = high_support[vv, uu] <= band_support[vv, uu]
-            band &= local_band & not_high_edge
+            has_vertical_band = (
+                vertical_band_support[vv, uu] >= DEPTH_HEIGHT_MIN_VERTICAL_SUPPORT_PIXELS
+            )
+            not_high_surface = (
+                (high_veto_support[vv, uu] <= DEPTH_HEIGHT_MAX_HIGH_VETO_PIXELS) |
+                has_vertical_band
+            )
+            band &= local_band & not_high_edge & not_high_surface
         if not np.any(band):
             return np.empty((0, 3), dtype=np.float32)
         return np.stack(
