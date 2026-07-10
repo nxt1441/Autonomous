@@ -62,6 +62,15 @@ ASTAR_FRONTIER_INFLATION_M = max(0.1333, ROBOT_MIN_CLEARANCE_M)
 ASTAR_FRONTIER_INFLATION   = max(1, round(ASTAR_FRONTIER_INFLATION_M / RESOLUTION))
 ASTAR_MIN_CLEARANCE_M      = 0.10
 ASTAR_MIN_CLEARANCE_PIXELS = max(1, round(ASTAR_MIN_CLEARANCE_M / RESOLUTION))
+# Per-cell weight applied to the cost map during A* search (see
+# _GridPlanner in astar_2_spline.py). The default cost_weight=1.5 there
+# added at most ~1.5 extra cost for the highest-cost (right-next-to-a-wall)
+# cell, smaller than a single step's own base cost (2.0/2.828) -- so a
+# shorter route hugging a wall could still out-score a longer route that
+# kept more clearance, and the planner would return the wall-hugging one.
+# Raised so a genuinely high-cost cell costs meaningfully more than the
+# detour needed to avoid it, and the search actually prefers to go around.
+ASTAR_COST_WEIGHT = 9.0
 
 # ── Exploration timing ───────────────────────────────────────────────────────
 EXPLORATION_FRONTIER_SELECTION_FREQ = 5
@@ -73,8 +82,15 @@ DWA_ANGULAR_SAMPLES               = [0, 1.5, -1.5, 2.5, -2.5, 3.0, -3.0, 3.5, -3
 DWA_HEADING_WEIGHT                = 4.0
 DWA_DISTANCE_WEIGHT               = 3.5
 DWA_SPEED_WEIGHT                  = 0.05
-DWA_COST_MAP_WEIGHT               = 1.5
+DWA_COST_MAP_WEIGHT               = 6.0
 DWA_UNKNOWN_WEIGHT                = 1.2
+# Trajectories predicted to enter a cell above this cost are rejected
+# outright (not just penalized in the score) -- was 0.92, which only ruled
+# out cells essentially touching a wall and let heading/distance still
+# win close, wall-hugging trajectories over safer wider ones. Lowered so a
+# genuinely tight squeeze past a corner is rejected before it's ever a
+# candidate, rather than merely discouraged.
+DWA_COST_MAP_REJECT_THRESHOLD     = 0.6
 
 # ── Path following ───────────────────────────────────────────────────────────
 PATH_FOLLOWING_TARGET_REACH_DISTANCE_M = 0.1333
