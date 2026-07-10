@@ -77,6 +77,7 @@ class MyRobot(Robot):
         self._floating_best_range = {}
         self._floating_vote_misses = {}
         self._floating_confirmed = set()
+        self._floating_confirmed_misses = {}
         # Contradiction counter for frustum-gated clearing: how many
         # distinct frames have shown the camera's own line of sight passing
         # clean through a confirmed cell to something farther away. Reset
@@ -614,6 +615,10 @@ class MyRobot(Robot):
                     continue
                 near_confirmed = self._floating_near_confirmed(
                     cell, FLOATING_WALL_ATTACH_RADIUS_CELLS)
+                directly_attached = self._floating_near_confirmed(
+                    cell, FLOATING_WALL_DIRECT_ATTACH_RADIUS_CELLS)
+                direct_neighbors = self._floating_confirmed_neighbor_count(
+                    cell, FLOATING_WALL_DIRECT_ATTACH_RADIUS_CELLS)
                 min_support = (FLOATING_WALL_ATTACH_MIN_FRAME_SUPPORT_CELLS
                                if near_confirmed
                                else FLOATING_WALL_MIN_FRAME_SUPPORT_CELLS)
@@ -629,6 +634,9 @@ class MyRobot(Robot):
                             else FLOATING_WALL_CONFIRM_VOTES)
                 if near_confirmed:
                     required = min(required, FLOATING_WALL_ATTACH_CONFIRM_VOTES)
+                if (directly_attached and
+                        direct_neighbors >= FLOATING_WALL_DIRECT_ATTACH_MIN_NEIGHBORS):
+                    required = min(required, FLOATING_WALL_DIRECT_ATTACH_CONFIRM_VOTES)
                 if self._floating_votes[cell] >= required:
                     newly_confirmed.add(cell)
 
@@ -637,10 +645,12 @@ class MyRobot(Robot):
                 self._floating_group[cell] = cell
                 self._floating_group_members[cell] = {cell}
                 self._floating_vote_misses.pop(cell, None)
+                self._floating_confirmed_misses.pop(cell, None)
                 self._floating_merge_touching(cell)
 
         self._decay_unconfirmed_floating_votes(candidate_cells, heading)
         self._frustum_clear_floating(heading)
+        self._clear_unseen_confirmed_floating(candidate_cells, heading)
 
         # A cell can end up here that LiDAR has since independently
         # confirmed as a real, grounded OBSTACLE for that SAME cell, or for
@@ -666,6 +676,7 @@ class MyRobot(Robot):
                 self._floating_confirmed.discard(cell)
                 self._floating_votes.pop(cell, None)
                 self._floating_vote_misses.pop(cell, None)
+                self._floating_confirmed_misses.pop(cell, None)
                 self._floating_best_range.pop(cell, None)
                 self._floating_clear_votes.pop(cell, None)
                 root = self._floating_find(cell)
@@ -751,6 +762,8 @@ class MyRobot(Robot):
                 members.discard(cell)
             self._floating_group.pop(cell, None)
             self._floating_votes.pop(cell, None)
+            self._floating_vote_misses.pop(cell, None)
+            self._floating_confirmed_misses.pop(cell, None)
             self._floating_best_range.pop(cell, None)
             mx, my = cell
             if grid[my, mx] == DEPTH_OBSTACLE:
@@ -793,6 +806,44 @@ class MyRobot(Robot):
             self._floating_votes.pop(cell, None)
             self._floating_best_range.pop(cell, None)
 
+    def _clear_unseen_confirmed_floating(self, candidate_cells, heading):
+        if not self._floating_confirmed:
+            return
+        to_remove = set()
+        for cell in list(self._floating_confirmed):
+            if cell in candidate_cells:
+                self._floating_confirmed_misses.pop(cell, None)
+                continue
+            if not self._floating_cell_in_depth_frustum(cell, heading):
+                continue
+            misses = self._floating_confirmed_misses.get(cell, 0) + 1
+            if misses < FLOATING_WALL_CONFIRMED_MISS_CLEAR_FRAMES:
+                self._floating_confirmed_misses[cell] = misses
+                continue
+            to_remove.add(cell)
+        if to_remove:
+            self._remove_confirmed_floating_cells(to_remove)
+
+    def _remove_confirmed_floating_cells(self, cells):
+        grid = self.occ_map.grid_map
+        h, w = grid.shape
+        for cell in cells:
+            self._floating_confirmed.discard(cell)
+            self._floating_votes.pop(cell, None)
+            self._floating_vote_misses.pop(cell, None)
+            self._floating_confirmed_misses.pop(cell, None)
+            self._floating_best_range.pop(cell, None)
+            self._floating_clear_votes.pop(cell, None)
+            root = self._floating_find(cell)
+            members = self._floating_group_members.get(root)
+            if members is not None:
+                members.discard(cell)
+            self._floating_group.pop(cell, None)
+            x, y = cell
+            if 0 <= x < w and 0 <= y < h and grid[y, x] == DEPTH_OBSTACLE:
+                grid[y, x] = FREESPACE
+        self.occ_map._depth_obstacle_cells.difference_update(cells)
+
     def _floating_near_confirmed(self, cell, radius):
         if not self._floating_confirmed:
             return False
@@ -805,6 +856,22 @@ class MyRobot(Robot):
                 if (cx + dx, cy + dy) in self._floating_confirmed:
                     return True
         return False
+
+    def _floating_confirmed_neighbor_count(self, cell, radius):
+        if not self._floating_confirmed:
+            return 0
+        cx, cy = cell
+        r2 = radius * radius
+        count = 0
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                if dx * dx + dy * dy > r2:
+                    continue
+                if (cx + dx, cy + dy) in self._floating_confirmed:
+                    count += 1
+        return count
 
     def _floating_candidate_allowed(self, cell, grid):
         x, y = cell
@@ -851,6 +918,7 @@ class MyRobot(Robot):
             self._floating_confirmed.discard(cell)
             self._floating_votes.pop(cell, None)
             self._floating_vote_misses.pop(cell, None)
+            self._floating_confirmed_misses.pop(cell, None)
             self._floating_best_range.pop(cell, None)
             self._floating_clear_votes.pop(cell, None)
             root = self._floating_find(cell)
@@ -945,6 +1013,7 @@ class MyRobot(Robot):
         self._floating_best_range = {}
         self._floating_vote_misses = {}
         self._floating_confirmed = set()
+        self._floating_confirmed_misses = {}
         self._floating_clear_votes = {}
         self._floating_group = {}
         self._floating_group_members = {}
