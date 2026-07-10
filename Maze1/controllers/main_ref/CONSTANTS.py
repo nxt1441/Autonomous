@@ -270,6 +270,8 @@ FLOATING_WALL_CONFIRM_VOTES_CLOSE = 3
 # instead of leaving a second unconfirmed dotted trace beside it.
 FLOATING_WALL_ATTACH_RADIUS_M = 0.12
 FLOATING_WALL_ATTACH_RADIUS_CELLS = max(1, round(FLOATING_WALL_ATTACH_RADIUS_M / RESOLUTION))
+FLOATING_WALL_DIRECT_ATTACH_RADIUS_M = 0.06
+FLOATING_WALL_DIRECT_ATTACH_RADIUS_CELLS = max(1, round(FLOATING_WALL_DIRECT_ATTACH_RADIUS_M / RESOLUTION))
 # Vote counter ceiling per cell (just prevents unbounded growth; irrelevant
 # once a cell has already crossed FLOATING_WALL_CONFIRM_VOTES).
 FLOATING_WALL_VOTE_CAP = 8
@@ -289,11 +291,16 @@ FLOATING_WALL_MIN_CONFIRMED_COMPONENT_CELLS = 3
 # extension thresholds only apply near an existing confirmed red segment.
 FLOATING_WALL_ATTACH_MIN_FRAME_SUPPORT_CELLS = 2
 FLOATING_WALL_ATTACH_CONFIRM_VOTES = 2
+FLOATING_WALL_DIRECT_ATTACH_CONFIRM_VOTES = 1
+FLOATING_WALL_DIRECT_ATTACH_MIN_NEIGHBORS = 2
 # Unconfirmed candidate votes are not permanent evidence. If the camera looks
 # through the same map area and the candidate is not re-seen for this many
 # depth refreshes, discard its accumulated votes so random edge noise cannot
 # slowly accumulate into a confirmed floating wall.
 FLOATING_WALL_CANDIDATE_MISS_DECAY_FRAMES = 3
+# Confirmed cells are still removable if the camera later revisits the cell
+# and repeatedly does not see robot-height floating evidence there.
+FLOATING_WALL_CONFIRMED_MISS_CLEAR_FRAMES = 10
 # Ignore candidate votes from the first few depth refreshes. The first camera
 # view often contains unsettled angle/height edge noise; delaying confirmation
 # prevents those startup artifacts from freezing into the map.
